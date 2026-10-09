@@ -1,6 +1,6 @@
 {
   "name": "dsh-peak-hours",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Run-window switch for DeepSeek Harness: run always, or only in off-peak hours — every task, including one already running, pauses when a China peak-price window starts and resumes when it ends.",
   "type": "module",
   "main": "lib/host/index.js",

@@ -14,3 +14,4 @@ verify/tmp/
 *.bak-*
 *.pre-instrument
 node_modules/
+*.tgz
