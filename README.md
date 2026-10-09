@@ -6,8 +6,9 @@ It adds a control to the right of the composer's mode buttons that chooses betwe
 **running only in off-peak hours**. In the second mode every dsh task — including one that is already
 running — is paused when a peak-price window starts and resumed automatically when it ends.
 
-Chinese documentation: [README.zh.md](README.zh.md)
+Available in **English** (this file) and **[中文](README.zh.md)**.
 
+[![中文文档](https://img.shields.io/badge/%E4%B8%AD%E6%96%87%E6%96%87%E6%A1%A3-README.zh.md-red)](README.zh.md)
 [![topic: dsh-plugin](https://img.shields.io/badge/topic-dsh--plugin-blue)](https://github.com/topics/dsh-plugin)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
