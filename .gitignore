@@ -1,0 +1,16 @@
+# Runtime sources extracted from the DSH app.asar for local research only.
+# They are DeepSeek's build artifacts, not ours — never publish them.
+_recon/
+_probe/
+
+# Local verification artifacts that carry machine-specific paths, raw
+# third-party downloads, or per-run logs.
+verify/raw/
+verify/logs/
+verify/baseline/
+verify/tmp/
+
+# Scratch and backups
+*.bak-*
+*.pre-instrument
+node_modules/

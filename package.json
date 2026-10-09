@@ -1,0 +1,66 @@
+{
+  "name": "dsh-peak-hours",
+  "version": "0.1.0",
+  "description": "Run-window switch for DeepSeek Harness: run always, or only in off-peak hours — every task, including one already running, pauses when a China peak-price window starts and resumes when it ends.",
+  "type": "module",
+  "main": "lib/host/index.js",
+  "exports": {
+    ".": "./lib/host/index.js",
+    "./client": "./lib/client/index.js",
+    "./core": "./lib/core/index.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib",
+    "README.md",
+    "README.zh.md",
+    "SPEC.md",
+    "cordis.patch.yml",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.mjs\"",
+    "test:verify": "node --test \"verify/**/*.test.mjs\"",
+    "smoke:host": "node tools/smoke-host.mjs",
+    "show:monday": "node tools/show-monday.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    }
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "peak-hours",
+    "off-peak",
+    "schedule",
+    "cost-control"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lion231226/dsh-peak-hours.git"
+  },
+  "homepage": "https://github.com/lion231226/dsh-peak-hours#readme",
+  "bugs": {
+    "url": "https://github.com/lion231226/dsh-peak-hours/issues"
+  },
+  "author": "lion231226",
+  "license": "MIT"
+}
