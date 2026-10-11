@@ -111,6 +111,25 @@ function Remove-Stale {
   }
 }
 
+# Bundle guard: the normal install path is `dsh plugin add`, which registers the
+# package in `dsh.profile.bundles`, and the bundle layer then contributes the
+# patch row from the package's own cordis.patch.yml. This script writes that row
+# by hand instead. Running it against a profile that already has the bundle would
+# leave two entries with the same id, and nothing downstream de-duplicates them —
+# the patch applier pushes inserted rows as-is and the cordis Loader has no
+# duplicate check — so refuse instead of creating a boot hazard.
+$profileManifest = Join-Path $profileDir 'package.json'
+if (Test-Path $profileManifest) {
+  $manifest = Get-Content $profileManifest -Raw | ConvertFrom-Json
+  if (@($manifest.dsh.profile.bundles) -contains $PackageName) {
+    Write-Host "[$PackageName] is already registered as a profile bundle in '$Profile'."
+    Write-Host "  Manage it with:  dsh plugin --profile $Profile remove $PackageName"
+    Write-Host "  This script is only for profiles without the bundle mechanism: a hand-written"
+    Write-Host "  row next to the bundle's own row would duplicate the entry."
+    exit 0
+  }
+}
+
 if ($Uninstall) {
   Save-Patch (Remove-Block (Read-Patch))
   if (Test-Path $targetDir) { Remove-Item $targetDir -Recurse -Force }

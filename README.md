@@ -40,6 +40,12 @@ package into `%DSH_HOME%\profiles\<profile>\node_modules\` and maintains one man
 Loader from reconciling the whole profile), waits for the plugin to answer, and re-activates the entry with a
 fresh row id if a previous attempt left it failed. No restart is required.
 
+> **Do not mix the two install paths.** `dsh plugin add` registers the package as a profile bundle, and the
+> bundle layer then contributes the patch row from the package's own `cordis.patch.yml`. `install.ps1` writes
+> that row by hand instead; running it against a profile that already has the bundle would leave two entries
+> with the same id, and nothing downstream de-duplicates them (the patch applier pushes inserted rows as-is and
+> the cordis Loader has no duplicate check). The script now refuses to run in that case.
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall

@@ -45,6 +45,12 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
 整个 profile 会停止 reconcile，后续任何改动都不再生效，只能重启恢复）；然后轮询
 `/api/peak-hours/health` 确认插件真的起来了。
 
+> **两种安装方式不要混用。** `dsh plugin add` 会把包登记为 profile bundle，由 bundle 层贡献它自己
+> `cordis.patch.yml` 里的 patch 行；`install.ps1` 则是手工往 profile 的 patch 文件里写这一行。
+> 对一个已登记 bundle 的 profile 再跑本脚本，会留下两条同 id 的 entry——补丁应用与 cordis Loader
+> 都不做去重（`dsh-app-boot` 的 insert 是直接 push，`cordis-plugin-loader` 没有重复检查），
+> 重启时有真实风险。脚本现在检测到这种情况会直接拒绝执行。
+
 #### 让一个已存在的 entry 真正生效：三条硬条件
 
 运行中的 Loader 对"已经 failed 的 entry"**不会自动重试**，而 Node 的 ESM 模块缓存按 **URL** 生效、
