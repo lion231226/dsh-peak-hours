@@ -164,6 +164,14 @@ plugin under the real cordis runtime. `verify/EVIDENCE.md` records each command 
 
 Node 24 rejects a directory argument for `node --test`, hence the glob patterns above.
 
+### Field test (real clock, no simulation)
+
+On Monday 2026-10-12, with the plugin in off-peak mode, a message submitted at 09:01:58 Beijing time — inside
+the morning peak window — was held for 178 minutes. The session log for that run shows the message entering the
+inbox at `09:01:58.530`, the turn opening two milliseconds later, then **no event of any kind** until
+`step/start` at `12:00:03.051` — three seconds after the boundary at 12:00:00 — followed by the model request at
+`12:00:03.054`. Nothing was dropped and no interval was skipped: the work simply waited for the window to end.
+
 ## License
 
 MIT
