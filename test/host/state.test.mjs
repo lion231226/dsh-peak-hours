@@ -1,5 +1,6 @@
 /**
- * State snapshot contract (SPEC §2.3) — the field set is frozen.
+ * State snapshot contract (SPEC §2.3 + the per-session fields of §9.3) — the
+ * field set is frozen.
  */
 
 import assert from 'node:assert/strict'
@@ -17,6 +18,8 @@ function stateAt(dateKey, time, overrides = {}) {
   const now = bj(dateKey, time)
   return buildState({
     mode: 'always',
+    defaultMode: 'always',
+    modeSource: 'default',
     now,
     info: schedule.classify(now),
     next: schedule.nextTransition(now),
@@ -24,14 +27,16 @@ function stateAt(dateKey, time, overrides = {}) {
   })
 }
 
-test('the state object carries exactly the frozen SPEC §2.3 field set', () => {
+test('the state object carries exactly the frozen SPEC §2.3 + §9.3 field set', () => {
   const state = stateAt(FRI, '09:30:00')
   assert.deepEqual(Object.keys(state).sort(), [
     'clockOverride',
     'config',
+    'defaultMode',
     'holidayCoverage',
     'holidayToday',
     'mode',
+    'modeSource',
     'msUntilTransition',
     'nextPhase',
     'nextTransitionAt',
@@ -42,16 +47,27 @@ test('the state object carries exactly the frozen SPEC §2.3 field set', () => {
     'peakWindows',
     'phase',
     'reason',
+    'sessionId',
     'timeZone',
     'unknownHolidayYear',
     'waitingTasks',
+    'waitingTasksTotal',
+    'waitingTasksUnresolved',
   ])
   assert.deepEqual(Object.keys(state.config), ['allowClockOverride'])
 })
 
+test('unresolved waiters are visible in the envelope (P1-1 observability)', () => {
+  const state = stateAt(FRI, '09:30:00', { waitingTasks: 2, waitingTasksTotal: 2, waitingTasksUnresolved: 2 })
+  assert.equal(state.waitingTasksUnresolved, 2)
+  assert.equal(stateAt(FRI, '09:30:00').waitingTasksUnresolved, 0, 'a clean state reports zero')
+  assert.equal(stateAt(FRI, '09:30:00', { waitingTasksUnresolved: -1 }).waitingTasksUnresolved, 0)
+  assert.equal(stateAt(FRI, '09:30:00', { waitingTasksUnresolved: 1.5 }).waitingTasksUnresolved, 0)
+})
+
 test('peak state inside the morning window', () => {
   const now = bj(FRI, '09:30:00')
-  const state = stateAt(FRI, '09:30:00', { mode: 'idle-only', waitingTasks: 2 })
+  const state = stateAt(FRI, '09:30:00', { mode: 'idle-only', waitingTasks: 2, waitingTasksTotal: 2 })
   assert.equal(state.mode, 'idle-only')
   assert.equal(state.phase, 'peak')
   assert.equal(state.reason, 'peak')
@@ -63,6 +79,7 @@ test('peak state inside the morning window', () => {
   assert.equal(state.msUntilTransition, 2.5 * 3600 * 1000)
   assert.equal(state.paused, true)
   assert.equal(state.waitingTasks, 2)
+  assert.equal(state.waitingTasksTotal, 2)
   assert.equal(state.holidayToday, null)
   assert.equal(state.holidayCoverage, 'known')
   assert.equal(state.unknownHolidayYear, null)
@@ -77,6 +94,60 @@ test('paused is true only for idle-only during peak', () => {
   assert.equal(stateAt(FRI, '09:30:00', { mode: 'always' }).paused, false)
   assert.equal(stateAt(FRI, '12:30:00', { mode: 'idle-only' }).paused, false)
   assert.equal(stateAt(SAT, '10:00:00', { mode: 'idle-only' }).paused, false)
+})
+
+test('the session fields report the resolved mode and its source', () => {
+  const state = stateAt(FRI, '09:30:00', {
+    mode: 'always',
+    defaultMode: 'idle-only',
+    modeSource: 'session',
+    sessionId: 'session-abc',
+  })
+  assert.equal(state.mode, 'always', 'the resolved per-session mode')
+  assert.equal(state.defaultMode, 'idle-only', 'the host-wide default is reported alongside')
+  assert.equal(state.modeSource, 'session')
+  assert.equal(state.sessionId, 'session-abc')
+  assert.equal(state.paused, false, 'paused follows the resolved mode, not the default')
+})
+
+test('no session in the question reports the default and the host-wide waiter count', () => {
+  const state = stateAt(FRI, '09:30:00', {
+    mode: 'idle-only',
+    defaultMode: 'idle-only',
+    modeSource: 'default',
+    sessionId: null,
+    waitingTasks: 7,
+    waitingTasksTotal: 7,
+  })
+  assert.equal(state.sessionId, null)
+  assert.equal(state.modeSource, 'default')
+  assert.equal(state.mode, state.defaultMode)
+  assert.equal(state.waitingTasks, state.waitingTasksTotal, 'Lead ruling: no session asked → host-wide count')
+  assert.equal(state.waitingTasks, 7)
+})
+
+test('a session question reports that session’s waiters next to the total', () => {
+  const state = stateAt(FRI, '09:30:00', {
+    sessionId: 'session-abc',
+    waitingTasks: 1,
+    waitingTasksTotal: 4,
+  })
+  assert.equal(state.sessionId, 'session-abc')
+  assert.equal(state.waitingTasks, 1)
+  assert.equal(state.waitingTasksTotal, 4)
+})
+
+test('an unknown session source degrades to default, and a blank id to null', () => {
+  assert.equal(stateAt(FRI, '09:30:00', { modeSource: 'nonsense' }).modeSource, 'default')
+  assert.equal(stateAt(FRI, '09:30:00', { sessionId: '   ' }).sessionId, null)
+  assert.equal(stateAt(FRI, '09:30:00', { sessionId: 42 }).sessionId, null)
+  assert.equal(stateAt(FRI, '09:30:00', { sessionId: ' x ' }).sessionId, 'x', 'ids are trimmed')
+})
+
+test('a missing defaultMode falls back to the resolved mode', () => {
+  const state = stateAt(FRI, '09:30:00', { mode: 'idle-only', defaultMode: undefined })
+  assert.equal(state.defaultMode, 'idle-only')
+  assert.equal(state.mode, 'idle-only')
 })
 
 test('idle reasons and the next peak transition', () => {
@@ -107,6 +178,8 @@ test('unknown holiday coverage is surfaced for the UI warning', () => {
   const now = bj(FRI, '09:30:00')
   const state = buildState({
     mode: 'always',
+    defaultMode: 'always',
+    modeSource: 'default',
     now,
     info: {
       phase: 'peak',
@@ -151,10 +224,16 @@ test('a broken core result degrades to a well-formed idle state', () => {
   assert.equal(buildState({ mode: 'nonsense', now: 0, info: null, next: null }).mode, 'always')
 })
 
-test('waitingTasks never leaks a negative or fractional count', () => {
-  assert.equal(stateAt(FRI, '09:30:00', { waitingTasks: -2 }).waitingTasks, 0)
-  assert.equal(stateAt(FRI, '09:30:00', { waitingTasks: 1.5 }).waitingTasks, 0)
-  assert.equal(stateAt(FRI, '09:30:00', { waitingTasks: 4 }).waitingTasks, 4)
+test('waiting tasks never leak a negative or fractional count', () => {
+  assert.equal(stateAt(FRI, '09:30:00', { waitingTasks: -2, waitingTasksTotal: -2 }).waitingTasks, 0)
+  assert.equal(stateAt(FRI, '09:30:00', { waitingTasks: 1.5, waitingTasksTotal: 1.5 }).waitingTasks, 0)
+  assert.equal(
+    stateAt(FRI, '09:30:00', { waitingTasks: 4, waitingTasksTotal: 9 }).waitingTasks,
+    9,
+    'no session asked → the host-wide count (Lead ruling 2026-10-14)',
+  )
+  assert.equal(stateAt(FRI, '09:30:00', { sessionId: 'a', waitingTasks: 4, waitingTasksTotal: 9 }).waitingTasks, 4)
+  assert.equal(stateAt(FRI, '09:30:00', { sessionId: 'a', waitingTasks: 4, waitingTasksTotal: 9 }).waitingTasksTotal, 9)
 })
 
 test('stateEnvelope wraps the state exactly once', () => {

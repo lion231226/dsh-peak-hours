@@ -80,6 +80,38 @@ test('P9: apply mounts the queue banner above the composer card', () => {
   assert.equal(ctx.calls.injections.includes('conversation.chat.node'), false)
 })
 
+/**
+ * R8 guard: the renderer only hands a component the props a registration's own
+ * `inject` face returns (`_recon/src/dsh-client-ui-renderer/lib/client.js:415-422`
+ * — no `inject` means `EMPTY_INJECTED_PROPS`), and it calls that face with the
+ * scope binding key, i.e. the session id. A registration without it would leave
+ * `props.sessionId` undefined and both occupants would render nothing on the
+ * real shell. This must be asserted on the REGISTRATION, not on a component the
+ * test can feed props to.
+ */
+test('R8: both registrations inject the session id the renderer passes as inject(key)', () => {
+  const mod = materialize(loadBundle())
+  const internals = mod.__internals
+  const ctx = createCtxStub()
+  mod.apply(ctx)
+  assert.equal(ctx.calls.registrations.length, 2)
+  for (const entry of ctx.calls.registrations) {
+    const { options } = entry
+    assert.equal(typeof options.inject, 'function', `${options.name} must carry an inject face`)
+    const injected = options.inject('S-1')
+    assert.deepEqual({ ...injected }, { sessionId: 'S-1' }, `${options.name} must hand the component its session id`)
+    // The renderer also passes `actions` as a second argument for store-backed
+    // entries; ours must ignore it rather than break.
+    assert.deepEqual({ ...options.inject('S-2', { anything: true }) }, { sessionId: 'S-2' })
+  }
+  // A session-maybe binding can call the face without a key; the component then
+  // simply has no session and renders nothing.
+  const [control] = ctx.calls.registrations
+  assert.equal(control.options.inject(undefined).sessionId, undefined)
+  assert.equal(control.options.inject('').sessionId, undefined)
+  assert.equal(internals.sessionProps('S-3').sessionId, 'S-3')
+})
+
 test('every registration runs inside ctx.effect so disposal is automatic', () => {
   const load = loadBundle()
   const exports = materialize(load)

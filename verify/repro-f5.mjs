@@ -15,13 +15,14 @@ async function attempt(concurrency) {
   const s = createModeStore({ file })
   await s.read()
   const modes = Array.from({ length: concurrency }, (_, i) => (i % 2 === 0 ? 'idle-only' : 'always'))
-  await Promise.all(modes.map((m) => s.write(m)))
+  // v2 store API (SPEC §9.1): `setMode(mode, sessionId)`; `null` writes the host-wide default.
+  await Promise.all(modes.map((m) => s.setMode(m, null)))
   let text
   try { text = readFileSync(file, 'utf8') } catch (e) { text = `<unreadable: ${e.code}>` }
   let ok = false, err = null
   try { JSON.parse(text); ok = true } catch (e) { err = e.message }
   const litter = readdirSync(dir)
-  const result = { concurrency, ok, err, text, litter, memMode: s.peek(), lastWanted: modes[modes.length - 1] }
+  const result = { concurrency, ok, err, text, litter, memMode: s.defaultMode, lastWanted: modes[modes.length - 1] }
   rmSync(dir, { recursive: true, force: true })
   return result
 }
@@ -30,7 +31,7 @@ let reproduced = 0
 for (const concurrency of [2, 4, 8, 16, 32, 64, 200]) {
   for (let i = 1; i <= 12; i++) {
     const r = await attempt(concurrency)
-    const bad = !r.ok || r.litter.length !== 1 || (r.ok && JSON.parse(r.text).mode !== r.lastWanted)
+    const bad = !r.ok || r.litter.length !== 1 || (r.ok && JSON.parse(r.text).default !== r.lastWanted)
     if (bad) {
       reproduced++
       console.log(`REPRODUCED  concurrency=${r.concurrency} attempt=${i}`)

@@ -42,6 +42,11 @@ function state(overrides = {}) {
     peakWindows: ['09:00-12:00', '14:00-18:00'],
     clockOverride: null,
     config: { allowClockOverride: true },
+    // SPEC 9.3 per-session fields, present on every v2 envelope.
+    sessionId: 'session-abc',
+    modeSource: 'session',
+    defaultMode: 'always',
+    waitingTasksTotal: 2,
     ...overrides,
   }
 }

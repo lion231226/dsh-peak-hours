@@ -112,19 +112,23 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
 
 ## HTTP 接口（回环，无需 GUI token）
 
+运行模式是**按会话**的：每个会话有自己的选择，任务按"它属于哪个会话"判定；没有单独设置的会话跟随 `default`。
+
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/peak-hours/health` | `{ ok, plugin, version }` |
-| GET | `/api/peak-hours/state` | 状态信封（见下） |
-| POST | `/api/peak-hours/mode` | `{ "mode": "always" \| "idle-only" }` |
-| POST | `/api/peak-hours/clock` | `{ "offsetMs": <int\|null>, "ttlMs"?: <int> }` 时间偏移（默认 TTL 10 分钟，到点自动清除） |
+| GET | `/api/peak-hours/state?session=<id>` | 状态信封（见下）；不带 `?session=` 时报 `default` |
+| POST | `/api/peak-hours/mode` | `{ "mode": "always" \| "idle-only" \| null, "session"?: "<id>", "scope"?: "session" \| "default" }`；`mode:null` + 会话 = **清除该会话的覆盖项**；两者都不带则写 `default`。要求 `Content-Type: application/json` |
+| POST | `/api/peak-hours/clock` | `{ "offsetMs": <int\|null>, "ttlMs"?: <int> }`，`ttlMs` 上限 30 分钟 |
 
 ```jsonc
 { "ok": true, "state": {
-  "mode": "always", "phase": "idle", "reason": "off-hours",
+  "mode": "always", "defaultMode": "always", "modeSource": "session",
+  "sessionId": "session-abc", "phase": "idle", "reason": "off-hours",
   "now": 1791541815888, "nowText": "2026-10-09 18:30:15",
   "nextTransitionAt": 1791766800000, "nextTransitionText": "2026-10-12 09:00:00", "nextPhase": "peak",
-  "msUntilTransition": 224984112, "paused": false, "waitingTasks": 0,
+  "msUntilTransition": 224984112, "paused": false,
+  "waitingTasks": 0, "waitingTasksTotal": 0, "waitingTasksUnresolved": 0,
   "holidayToday": null, "holidayCoverage": "known", "unknownHolidayYear": null,
   "timeZone": "Asia/Shanghai (UTC+8)", "peakWindows": ["09:00-12:00", "14:00-18:00"],
   "clockOverride": null, "config": { "allowClockOverride": true } } }
@@ -132,9 +136,11 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
 
 `clockOverride` 是**测试/演示**用的时间偏移（把"现在"伪装成任意时刻，用来验证暂停/恢复），
 必须带 TTL 自动过期——否则伪装成高峰后，被扣住的任务（包括发起测试的会话）可能要一直等到真实空闲窗口。
-设 `DSH_PEAK_HOURS_ALLOW_CLOCK=0` 可整体关闭该接口。
+设 `DSH_PEAK_HOURS_ALLOW_CLOCK=0` 可整体关闭该接口；它动的是**全宿主的时钟**，所以 `ttlMs` 有 30 分钟上限。
 
-`waitingTasks` 是**宿主全局**的闸门等待数，可能包含其他会话在跑的任务。
+`waitingTasks` 数的是**`?session=` 指定的那个会话**；不带该参数时数整个宿主——老的不带 session 的
+curl 示例因此保持原义。`waitingTasksTotal` 恒为全宿主数。`waitingTasksUnresolved` 是"会话解析不出来"
+的等待者数量：它们按 `default` 判定，这个计数存在的意义是让**解析失败可见**，而不是看起来像"没有任务在等"。
 
 ## 节假日数据
 
@@ -155,8 +161,21 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
 | `allowClockOverride` | `true` | 是否允许 `POST /api/peak-hours/clock` |
 | `version` | 读 package.json | `/health` 上报的版本 |
 
-模式持久化在 `%DSH_HOME%\peak-hours-state.json`（原子写 + 写入串行化；文件损坏回退 `always` 并只记一条日志）。
+每个会话的选择持久化在 `%DSH_HOME%\peak-hours-state.json`：
+`{ "version": 2, "default": "always", "sessions": { "<sessionId>": "idle-only" } }`（原子写 + 写入串行化）。
+旧格式 `{ "mode": ... }` 在首次读取时迁移：该值成为 `default`、`sessions` 为空；文件损坏则回退
+`always` + 空表并只记一条日志。会话表上限 500 条，淘汰"最久未被写入"的一条，每次淘汰记一条日志。
 卸载时全部监听器、计时器、路由随 fiber 一起释放，不留残留。
+
+## 从 0.1.x 升级
+
+运行模式原本是**全宿主单值**，现在改为**按会话**，旧值成为 `default`——所以**升级后，所有没有单独设置过的
+会话行为与升级前完全一致**。有两点要知道：
+
+* **安装后请刷新页面。** 仍运行 0.1.x 客户端的页面发的是裸 `{mode}` 写，新宿主会正确地把它读作"写 `default`"
+  ——也就是说旧 bundle 会复现本次修复的那个缺陷本身。
+* **降级会丢 `sessions`。** 0.1.x 不认识 `sessions` 表，会把文件按旧格式整体重写；回退版本前请先备份或删除
+  `%DSH_HOME%\peak-hours-state.json`。
 
 ## 已知边界
 

@@ -232,6 +232,111 @@ window.__ModuleLoader__.load({
 * Probe artifacts were removed afterwards (patch file restored from a timestamped backup,
   package directory deleted, route back to 401).
 
+## 9. Per-session run windows (2026-10-14) — supersedes the global mode
+
+The mode is no longer one host-wide value. Every session carries its own choice, and a task is judged by the
+choice of the session that owns it.
+
+### 9.1 State file (v2)
+
+`<DSH_HOME>/peak-hours-state.json`:
+
+```json
+{ "version": 2, "default": "always", "sessions": { "session-abc": "idle-only" } }
+```
+
+* `default` is the mode used by a session with no explicit choice.
+* Migration from v1 `{ "mode": "..." }`: `default` becomes that mode, `sessions` starts empty, log once.
+* A corrupt or unreadable file still falls back to `{ default: "always", sessions: {} }` and logs once.
+
+### 9.2 Session resolution (host) — the only place a mode is decided
+
+| Gate | Where the sessionId comes from |
+| --- | --- |
+| `agent/pre-step` | **`payload.agent?.session?.id ?? payload.agent?.id`**. The real dispatch injects `agent` into the payload (`dsh-agent/lib/types/dispatch.js:37-42`); the listener's `this` is an opaque dsh-scope carrier, **not** the Agent — measured with the real cordis runtime on 2026-10-14, `this.session` and `this.id` are both `undefined`. Falls back to `ctx.agents.currentInitiator()?.session?.id`. |
+| `tools/pre-execute` | the payload **is** the ToolExecution: `exec.agent?.session?.id`, falling back to `ctx.agents.currentInitiator()?.session?.id` |
+
+Official listeners on this event read the injected agent from the payload, never from `this`
+(`dsh-agent/lib/index.js:193`, `dsh-agent/lib/types/model-selection.js:76`). Do not reintroduce a `this`-based
+read: it fails silently and takes the whole per-session feature with it (Lead ruling 2026-10-14, after the
+acceptance expert reproduced it).
+
+* Resolution order: `sessions[sessionId]` → `default`.
+* An unresolvable sessionId resolves to `default` — never "silently always allowed" and never "always held".
+* A gate checks **only its own session's** mode: `always` in session A must never be held because session B is
+  `idle-only`, and an `idle-only` session must be held even while another session runs freely.
+* Waiters are recorded per session, so the state envelope can report both counts.
+
+### 9.3 HTTP API
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| GET | `/api/peak-hours/state?session=<id>` | adds `sessionId`, `mode` (resolved), `defaultMode`, `modeSource: 'session' \| 'default'`, `waitingTasks` (this session), `waitingTasksTotal` |
+| POST | `/api/peak-hours/mode` | body `{ mode, session?: '<id>', scope?: 'session' \| 'default' }` |
+| POST | `/api/peak-hours/clock` | unchanged — it moves the clock, not a session's choice |
+| GET | `/api/peak-hours/health` | unchanged |
+
+* `scope: 'session'` (implied when `session` is present) writes `sessions[sessionId]`.
+* `scope: 'default'` writes `default`.
+* Neither `session` nor `scope` present → writes `default`, so the existing curl examples keep working.
+* `mode: null` together with a usable `session` **clears** that session's override, so the session follows
+  `default` again. Without this there is no way to hand a session back to the default, and verification scripts
+  would have to leave synthetic sessions behind in the real state file (architect review P1-2, Lead ruling).
+* No `waitingTasksScope` field is added: the presence of `?session=` is the discriminator, and
+  `waitingTasksTotal` is the one unambiguous global field (architect P2-2, Lead ruling).
+* Omitting `session` on GET → the envelope reports `default` as `mode` with `modeSource: 'default'`.
+* `waitingTasks` is the **current session's** count when `?session=` is present, and the **host-wide** count
+  when it is absent — so the existing session-less curl examples, README snippets and verification scripts keep
+  working. `waitingTasksTotal` is always the host-wide number (Lead ruling 2026-10-14).
+
+### 9.4 Client
+
+* The composer control and the queue banner act on the **current session** (the `sessionId` slot prop). With no
+  session they render nothing.
+* The popover states the scope of a change — "仅此会话" for a session write, "所有未单独设置的会话" for a default
+  write — and shows this session's resolved mode plus where it comes from.
+* The banner counts only this session's waiting tasks.
+
+### 9.5 Unchanged
+
+* `lib/core/**` (phase math, holiday calendar) — untouched.
+* The clock override stays host-wide.
+* `apply()` keeps resolving to `undefined`; every registration stays effect-owned and disposable.
+
+### 9.6 Bounded session table (Lead ruling 2026-10-14)
+
+The session table is capped (500 entries) so a long-lived install cannot grow the file without bound. The
+eviction policy is **LRU-by-set**: writing a session's mode refreshes its recency, and the least recently
+written entry is dropped when the table is full. An evicted session falls back to `default`; each eviction is
+logged once so the cause is diagnosable from the host log. No UI warning is required — the session that was
+dropped reports `modeSource: 'default'`, which is exactly the truth.
+
+### 9.3a Request validation and write fencing (Lead ruling 2026-10-14, after the security review)
+
+`POST /mode` is an unauthenticated loopback write endpoint, so a malformed request must never widen its own
+scope — a "this session only" intent silently becoming a "all sessions without their own entry" write is a
+privilege escalation in miniature:
+
+* `session`, when present, must be a non-empty string after trim, at most **128** characters → otherwise 400.
+* `scope` accepts only `'session'` or `'default'`; any other value → 400 (never "fall back to default").
+* `scope: 'session'` without a usable session → 400.
+* `scope: 'default'` together with `session` → 400 (ambiguous: reject instead of guessing).
+* Neither `session` nor `scope` → writes `default`, the documented backward-compatible form.
+* Reject `__proto__`, `constructor` and `prototype` as session ids (400); store the table with a null prototype.
+
+**Write fencing.** POST requests must carry `Content-Type: application/json`; anything else → 400. Measured
+without it: a `text/plain` body is still parsed, and a request carrying `Origin: https://evil.example` is
+processed — i.e. any page in the user's browser can reach the write path with a preflight-free "simple
+request". The client already sends JSON; every curl example in the docs and in `tools/` must send the header.
+
+**Clock lever.** `POST /clock` clamps `ttlMs` to 30 minutes (400 above). The override moves the clock for
+*every* session, so an unbounded TTL turns a debugging aid into a host-wide lever that bypasses the per-session
+isolation this section introduces. Production installs should set `DSH_PEAK_HOURS_ALLOW_CLOCK=0`.
+
+**Default writes re-evaluate every default-resolving waiter.** Changing `default` must trigger a full gate
+re-evaluation (not a session-filtered one); otherwise a session without its own entry stays held until the next
+boundary even though the user just switched the default to `always`.
+
 ## 4. Rules
 
 * Only write inside your own scope. Never edit another scope's files; send a message instead.

@@ -71,7 +71,16 @@ export function makeWebServerStub() {
         writeHead(code) { status = code; this.headersSent = true },
         end(text) { if (text !== undefined) payload = JSON.parse(text) },
       }
-      const req = { method, headers: {}, socket: { remoteAddress: '127.0.0.1' }, async *[Symbol.asyncIterator]() { if (body !== undefined) yield Buffer.from(JSON.stringify(body)) } }
+      const req = {
+        method,
+        // SEC-4: the write routes fence on media type — a POST without
+        // `content-type: application/json` is answered 415 (and `sec-fetch-site: cross-site` 403).
+        // Omitting the header here made the real-cordis mount tests fail with 415 for the wrong
+        // reason; the stub must send what the shipped client sends.
+        headers: method === 'POST' ? { 'content-type': 'application/json' } : {},
+        socket: { remoteAddress: '127.0.0.1' },
+        async *[Symbol.asyncIterator]() { if (body !== undefined) yield Buffer.from(JSON.stringify(body)) },
+      }
       await route.handler(req, res)
       return { status, body: payload }
     },

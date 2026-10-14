@@ -359,3 +359,237 @@ test('peakLeadMs is an opt-in lead guard and is off by default', async () => {
   await flush()
   assert.equal(held.status, 'resolved')
 })
+
+// ── SPEC §9.2: the gate judges a task by ITS OWN session ─────────────────────
+
+test('per-session: session A runs freely while session B is held in the same peak window', async () => {
+  const host = createFakeGate({
+    startMs: bj(FRI, '10:00:00'),
+    mode: 'idle-only', // the host default
+    sessionModes: { 'session-a': 'always', 'session-b': 'idle-only' },
+  })
+
+  const free = observe(host.gate.wait(controller().signal, 'session-a'))
+  const held = observe(host.gate.wait(controller().signal, 'session-b'))
+  await flush()
+  assert.equal(free.status, 'resolved', 'session A is always-on: it must never be held because B is idle-only')
+  assert.equal(held.status, 'pending', 'session B is idle-only: it must be held even while A runs')
+  assert.equal(host.gate.waiterCount, 1, 'only B is waiting')
+  assert.equal(host.timers.liveTimerCount, 1)
+  assert.equal(host.gate.isPaused('session-a'), false)
+  assert.equal(host.gate.isPaused('session-b'), true)
+})
+
+test('per-session: waiter accounting is per session and host-wide', async () => {
+  const host = createFakeGate({
+    startMs: bj(FRI, '10:00:00'),
+    mode: 'idle-only',
+    sessionModes: { 'session-a': 'idle-only', 'session-b': 'idle-only' },
+  })
+  const a1 = observe(host.gate.wait(controller().signal, 'session-a'))
+  const a2 = observe(host.gate.wait(controller().signal, 'session-a'))
+  const b1 = observe(host.gate.wait(controller().signal, 'session-b'))
+  await flush()
+  assert.equal(host.gate.waiterCountFor('session-a'), 2)
+  assert.equal(host.gate.waiterCountFor('session-b'), 1)
+  assert.equal(host.gate.waiterCountFor('session-c'), 0)
+  assert.equal(host.gate.waiterCount, 3, 'waitingTasksTotal')
+  assert.equal(host.timers.liveTimerCount, 1, 'all sessions share the single boundary timer')
+
+  a1.value
+  host.timers.advanceTo(bj(FRI, '12:00:00'))
+  await flush()
+  for (const waiter of [a1, a2, b1]) assert.equal(waiter.status, 'resolved')
+  assert.equal(host.gate.waiterCount, 0)
+  assert.equal(host.timers.liveTimerCount, 0)
+})
+
+test('per-session: a mode write releases only that session and leaves the others held', async () => {
+  // `b` carries an explicit override; `a` and `c` follow the host default.
+  const host = createFakeGate({
+    startMs: bj(FRI, '10:00:00'),
+    mode: 'idle-only',
+    sessionModes: { b: 'idle-only' },
+  })
+  const a = observe(host.gate.wait(controller().signal, 'a'))
+  const b = observe(host.gate.wait(controller().signal, 'b'))
+  const c = observe(host.gate.wait(controller().signal, 'c'))
+  await flush()
+  assert.equal(host.gate.waiterCount, 3)
+
+  host.setSessionMode('b', 'always')
+  host.gate.notifyChanged('b')
+  await flush()
+  assert.equal(a.status, 'pending', 'a is untouched')
+  assert.equal(b.status, 'resolved', 'b switched to always and is released at once')
+  assert.equal(c.status, 'pending', 'c is untouched')
+  assert.equal(host.gate.waiterCount, 2)
+  assert.equal(host.timers.liveTimerCount, 1, 'the remaining sessions keep the single timer')
+
+  // A default write releases the sessions that follow the default; b's own
+  // override is gone with it, and any session still on idle-only would stay.
+  host.setMode('always')
+  host.gate.notifyChanged()
+  await flush()
+  assert.equal(a.status, 'resolved')
+  assert.equal(c.status, 'resolved')
+  assert.equal(host.gate.waiterCount, 0)
+  assert.equal(host.timers.liveTimerCount, 0)
+})
+
+test('per-session: a session with its own override ignores a default write', async () => {
+  const host = createFakeGate({
+    startMs: bj(FRI, '10:00:00'),
+    mode: 'idle-only',
+    sessionModes: { pinned: 'idle-only' },
+  })
+  const pinned = observe(host.gate.wait(controller().signal, 'pinned'))
+  const follower = observe(host.gate.wait(controller().signal, 'follower'))
+  await flush()
+  assert.equal(host.gate.waiterCount, 2)
+
+  host.setMode('always')
+  host.gate.notifyChanged()
+  await flush()
+  assert.equal(follower.status, 'resolved', 'the follower picks up the new default')
+  assert.equal(pinned.status, 'pending', 'the pinned override keeps its own choice')
+  assert.equal(host.gate.waiterCount, 1)
+
+  host.setSessionMode('pinned', 'always')
+  host.gate.notifyChanged('pinned')
+  await flush()
+  assert.equal(pinned.status, 'resolved')
+  assert.equal(host.timers.liveTimerCount, 0)
+})
+
+test('per-session: a committed write for one session never disturbs another session', async () => {
+  const host = createFakeGate({
+    startMs: bj(FRI, '10:00:00'),
+    mode: 'idle-only',
+    sessionModes: { a: 'idle-only', b: 'idle-only' },
+  })
+  const a = observe(host.gate.wait(controller().signal, 'a'))
+  const b = observe(host.gate.wait(controller().signal, 'b'))
+  await flush()
+
+  // A writes to session A *without* changing its mode (always → always is not
+  // the case here: A stays idle-only), simulating an unrelated session write.
+  host.gate.notifyChanged('b')
+  await flush()
+  assert.equal(a.status, 'pending')
+  assert.equal(b.status, 'pending')
+  assert.equal(host.gate.waiterCount, 2)
+  host.gate.notifyChanged(undefined)
+  await flush()
+  assert.equal(a.status, 'pending')
+  assert.equal(b.status, 'pending')
+})
+
+test('per-session: an unresolvable sessionId follows the default mode, never a fixed answer', async () => {
+  // default = idle-only → an unresolved task is held (must not be silently allowed).
+  const heldHost = createFakeGate({ startMs: bj(FRI, '10:00:00'), mode: 'idle-only', sessionModes: {} })
+  const held = observe(heldHost.gate.wait(controller().signal, undefined))
+  await flush()
+  assert.equal(held.status, 'pending', 'default idle-only holds an unresolved task')
+  assert.equal(heldHost.gate.waiterCountFor(undefined), 1, 'it is counted in the no-session bucket')
+  assert.equal(heldHost.gate.waiterCountFor(''), 1)
+  assert.equal(heldHost.gate.waiterCountFor('other'), 0)
+
+  // default = always → an unresolved task runs (must not be held by someone else's choice).
+  const freeHost = createFakeGate({
+    startMs: bj(FRI, '10:00:00'),
+    mode: 'always',
+    sessionModes: { other: 'idle-only' },
+  })
+  const free = observe(freeHost.gate.wait(controller().signal, undefined))
+  await flush()
+  assert.equal(free.status, 'resolved', 'default always releases an unresolved task')
+  assert.equal(freeHost.gate.waiterCount, 0)
+  assert.equal(freeHost.timers.liveTimerCount, 0)
+})
+
+test('per-session: an override beats the default in both directions', async () => {
+  const host = createFakeGate({ startMs: bj(FRI, '10:00:00'), mode: 'always', sessionModes: { strict: 'idle-only' } })
+  const strict = observe(host.gate.wait(controller().signal, 'strict'))
+  const loose = observe(host.gate.wait(controller().signal, 'loose'))
+  await flush()
+  assert.equal(strict.status, 'pending', 'the override wins over an always default')
+  assert.equal(loose.status, 'resolved')
+
+  const inverse = createFakeGate({ startMs: bj(FRI, '10:00:00'), mode: 'idle-only', sessionModes: { loose: 'always' } })
+  const free = observe(inverse.gate.wait(controller().signal, 'loose'))
+  const held = observe(inverse.gate.wait(controller().signal, 'other'))
+  await flush()
+  assert.equal(free.status, 'resolved', 'the override wins over an idle-only default')
+  assert.equal(held.status, 'pending')
+})
+
+test('per-session: an abort only ends its own wait, peers stay held', async () => {
+  const host = createFakeGate({ startMs: bj(FRI, '10:00:00'), mode: 'idle-only' })
+  const doomed = controller()
+  const a = observe(host.gate.wait(doomed.signal, 'a'))
+  const b = observe(host.gate.wait(controller().signal, 'b'))
+  await flush()
+  assert.equal(host.gate.waiterCountFor('a'), 1)
+
+  doomed.abort(new Error('session a stopped'))
+  await flush()
+  assert.equal(a.status, 'rejected')
+  assert.equal(b.status, 'pending')
+  assert.equal(host.gate.waiterCountFor('a'), 0)
+  assert.equal(host.gate.waiterCountFor('b'), 1)
+  assert.equal(host.timers.liveTimerCount, 1)
+})
+
+test('per-session: a broken mode resolver fails open per session', async () => {
+  const host = createFakeGate({
+    startMs: bj(FRI, '10:00:00'),
+    getMode: () => {
+      throw new Error('store exploded')
+    },
+  })
+  const waiter = observe(host.gate.wait(controller().signal, 'a'))
+  await flush()
+  assert.equal(waiter.status, 'resolved', 'an unreadable mode must never strand a task')
+  assert.equal(host.timers.liveTimerCount, 0)
+})
+
+test('an unresolved session is observable: one warning and a dedicated bucket (P1-1)', async () => {
+  const logs = []
+  const host = createFakeGate({
+    startMs: bj(FRI, '10:00:00'),
+    mode: 'idle-only',
+    log: { warn: (message) => logs.push(String(message)) },
+  })
+  const first = observe(host.gate.wait(controller().signal, undefined))
+  const second = observe(host.gate.wait(controller().signal, ''))
+  const named = observe(host.gate.wait(controller().signal, 'session-a'))
+  await flush()
+  assert.equal(first.status, 'pending')
+  assert.equal(second.status, 'pending')
+  assert.equal(named.status, 'pending')
+  assert.equal(host.gate.unresolvedWaiterCount, 2, 'both unresolved tasks are counted')
+  assert.equal(host.gate.waiterCountFor(''), 2)
+  assert.equal(host.gate.waiterCountFor('session-a'), 1)
+  assert.equal(host.gate.waiterCount, 3)
+  assert.equal(logs.filter((message) => message.includes('no resolvable session id')).length, 1, 'warned exactly once, not per waiter')
+
+  host.timers.advanceTo(bj(FRI, '12:00:00'))
+  await flush()
+  assert.equal(host.gate.unresolvedWaiterCount, 0)
+})
+
+test('per-session: switching the default to idle-only immediately holds a fresh check', async () => {
+  const host = createFakeGate({ startMs: bj(FRI, '10:00:00'), mode: 'always', sessionModes: {} })
+  const before = observe(host.gate.wait(controller().signal, 'no-override'))
+  await flush()
+  assert.equal(before.status, 'resolved', 'always releases')
+
+  host.setMode('idle-only')
+  host.gate.notifyChanged()
+  const after = observe(host.gate.wait(controller().signal, 'no-override'))
+  await flush()
+  assert.equal(after.status, 'pending', 'the reverse switch must hold immediately, not at the next boundary')
+  assert.equal(host.gate.waiterCountFor('no-override'), 1)
+  assert.equal(host.timers.liveTimerCount, 1)
+})

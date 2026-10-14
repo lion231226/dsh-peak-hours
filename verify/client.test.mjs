@@ -132,8 +132,16 @@ test('apply() registers BOTH slot occupants with the frozen ids/orders', () => {
 
 test('SPEC §2.5 labels: the pill reads exactly 全天运行 / 运行中 / 已暂停', () => {
   const { deriveView, translate, DICTS, DOT_COLOR, EMPTY_SNAPSHOT } = exported.__internals
+  // The SP4 client requires a v2 envelope: it needs `modeSource` + `defaultMode` to consider the
+  // host current, and reads a v1-shaped envelope as "unavailable" by design (SPEC §9.4, verified
+  // as positive evidence by the Lead). The helper therefore enriches each state with the frozen v2
+  // fields; an explicit field in the literal still wins.
   const label = (state, error = null) => {
-    const view = deriveView({ state, fetchedAtMs: Date.now(), error })
+    const enriched = {
+      sessionId: 'verify-sess', modeSource: 'default', defaultMode: state.mode,
+      waitingTasks: 0, waitingTasksTotal: 0, ...state,
+    }
+    const view = deriveView({ state: enriched, fetchedAtMs: Date.now(), error })
     return { text: translate(DICTS, 'zh', view.labelKey), dotColor: view.dotColor, view }
   }
 
@@ -180,13 +188,22 @@ test('both registered components render without throwing under a stub React', ()
   }
 
   let pill
-  assert.doesNotThrow(() => { pill = PeakHoursControl({}) }, 'the composer pill must render')
+  // SPEC §9.4: both occupants act on the CURRENT session — with no session they render nothing.
+  // That is a deliberate new behaviour, so it is asserted rather than treated as a failure.
+  let withoutSession
+  assert.doesNotThrow(() => { withoutSession = PeakHoursControl({}) }, 'the pill must not throw without a session')
+  assert.equal(withoutSession, null, 'no session ⇒ the composer control renders nothing (SPEC §9.4)')
+  let bannerWithout
+  assert.doesNotThrow(() => { bannerWithout = PeakHoursBanner({}) }, 'the banner must not throw without a session')
+  assert.equal(bannerWithout, null, 'no session ⇒ the queue banner renders nothing (SPEC §9.4)')
+
+  assert.doesNotThrow(() => { pill = PeakHoursControl({ sessionId: 'verify-sess' }) }, 'the composer pill must render with a session')
   walk(pill)
-  assert.ok(leaves.length > 0, 'the pill must render at least one text label')
+  assert.ok(leaves.length > 0, 'the pill must render at least one text label when it has a session')
 
   // P9 banner: with an empty store it is not showing, so it must render nothing — and above all
   // must not throw (a throwing slot component would break the composer).
   let banner
-  assert.doesNotThrow(() => { banner = PeakHoursBanner({}) }, 'the queue banner must not throw')
+  assert.doesNotThrow(() => { banner = PeakHoursBanner({ sessionId: 'verify-sess' }) }, 'the queue banner must not throw')
   assert.equal(banner, null, 'the queue banner must render nothing while no work is being held')
 })

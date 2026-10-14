@@ -23,7 +23,8 @@ import { acceptPluginResult, bj, createFakeCtx, createFakeTimers, flush, observe
 const PEAK_DAY = '2026-11-19' // Thursday, no statutory holiday
 const PEAK_AT = bj(PEAK_DAY, '10:00:00')
 const AFTER_MORNING = bj(PEAK_DAY, '12:00:05')
-const LONG_TTL = 8 * 3600 * 1000
+/** Inside the SEC-6 ceiling (30 min) but long enough for a whole test. */
+const LONG_TTL = 25 * 60_000
 
 /** Run one body against a private DSH_HOME, restoring the env afterwards. */
 async function withHome(t, body) {
@@ -169,7 +170,8 @@ test('apply registers the primary gate, the mid-turn gate and the four routes', 
   assert.deepEqual([...fake.routes.keys()].sort(), Object.values(ROUTE_PATHS).sort())
 
   assert.equal(surface.core === 'core' || surface.core === 'fallback', true)
-  assert.equal(surface.version, '0.1.0', 'the reported version comes from package.json')
+  const pkg = JSON.parse(await readFile(new URL('../../package.json', import.meta.url), 'utf8'))
+  assert.equal(surface.version, pkg.version, 'the reported version comes from package.json')
   assert.equal(surface.allowClockOverride, true)
 
   // A fresh DSH_HOME has no state file: the mode starts at always, silently.
@@ -315,7 +317,7 @@ test('the mode write persists to <DSH_HOME>/peak-hours-state.json', async (t) =>
   const { home, surface } = await mountPlugin(t)
   await surface.handlers.mode({ mode: 'idle-only' })
   const raw = JSON.parse(await readFile(join(home, STATE_FILE_NAME), 'utf8'))
-  assert.equal(raw.mode, 'idle-only')
+  assert.deepEqual(raw, { version: 2, default: 'idle-only', sessions: {} })
 })
 
 test('switching back to always releases held tasks immediately', async (t) => {
@@ -440,4 +442,213 @@ test('two mounts in the same host do not share state', async (t) => {
   assert.equal((await first.surface.handlers.state()).body.state.mode, 'idle-only')
   assert.equal((await second.surface.handlers.state()).body.state.mode, 'always')
   assert.notEqual(first.fake.ctx, second.fake.ctx)
+})
+
+// ── SPEC §9.2: the session comes from the task, never from the last write ────
+//
+// These cases deliberately do NOT bind `this` on the listener: the frozen
+// contract reads `payload.agent`, and a test that also made `this` the agent
+// would pass even if the implementation read the wrong source.
+
+test('pre-step: session A runs while session B is held, driven only by payload.agent', async (t) => {
+  const { fake, surface, timers } = await mountPlugin(t)
+  await surface.handlers.mode({ mode: 'idle-only' }) // the host default
+  await surface.handlers.mode({ mode: 'always', session: 'session-a' })
+  setNow(surface, PEAK_AT)
+
+  const payloadFor = (sessionId) => ({
+    messages: [],
+    turn: 1,
+    step: 1,
+    signal: new AbortController().signal,
+    agent: { session: { id: sessionId } },
+  })
+
+  const freeA = observe(fake.invoke('agent/pre-step', payloadFor('session-a')))
+  const heldB = observe(fake.invoke('agent/pre-step', payloadFor('session-b')))
+  const heldNone = observe(fake.invoke('agent/pre-step', payloadFor('session-unknown')))
+  await flush()
+
+  assert.equal(freeA.status, 'resolved', 'A is always-on: it must not be held because B is idle-only')
+  assert.equal(heldB.status, 'pending', 'B has no override → follows the idle-only default and is held')
+  assert.equal(heldNone.status, 'pending', 'an unlisted session follows the default too')
+  assert.equal(surface.gate.waiterCountFor('session-a'), 0)
+  assert.equal(surface.gate.waiterCountFor('session-b'), 1)
+  assert.equal(surface.gate.waiterCountFor('session-unknown'), 1)
+  assert.equal(surface.gate.waiterCount, 2)
+
+  const stateA = (await surface.handlers.state({ session: 'session-a' })).body.state
+  assert.equal(stateA.modeSource, 'session')
+  assert.equal(stateA.waitingTasks, 0, 'A holds nothing')
+  assert.equal(stateA.waitingTasksTotal, 2)
+  assert.equal(stateA.waitingTasksUnresolved, 0, 'both waiters resolved their session')
+  const stateB = (await surface.handlers.state({ session: 'session-b' })).body.state
+  assert.equal(stateB.waitingTasks, 1, 'the count is that session’s')
+  assert.equal(stateB.waitingTasksTotal, 2)
+
+  // The idle boundary releases every session together.
+  setNow(surface, AFTER_MORNING)
+  timers.advanceBy(bj(PEAK_DAY, '12:00:00') - bj(PEAK_DAY, '10:00:00'))
+  await flush()
+  assert.equal(heldB.status, 'resolved')
+  assert.equal(heldNone.status, 'resolved')
+  assert.equal(surface.gate.waiterCount, 0)
+  assert.equal(surface.gate.timerArmed, false)
+})
+
+test('pre-step: a session write releases only that session through the real listener', async (t) => {
+  const { fake, surface } = await mountPlugin(t)
+  await surface.handlers.mode({ mode: 'idle-only' })
+  setNow(surface, PEAK_AT)
+
+  const payloadFor = (sessionId) => ({ messages: [], turn: 1, step: 1, signal: new AbortController().signal, agent: { session: { id: sessionId } } })
+  const a = observe(fake.invoke('agent/pre-step', payloadFor('session-a')))
+  const b = observe(fake.invoke('agent/pre-step', payloadFor('session-b')))
+  await flush()
+  assert.equal(a.status, 'pending')
+  assert.equal(b.status, 'pending')
+
+  await surface.handlers.mode({ mode: 'always', session: 'session-b' })
+  await flush()
+  assert.equal(a.status, 'pending', 'A keeps following the idle-only default')
+  assert.equal(b.status, 'resolved', 'B was switched to always and resumes immediately')
+  assert.equal(surface.gate.waiterCount, 1)
+})
+
+test('tools gate: the session comes from exec.agent', async (t) => {
+  const { fake, surface } = await mountPlugin(t)
+  await surface.handlers.mode({ mode: 'idle-only' })
+  await surface.handlers.mode({ mode: 'always', session: 'session-a' })
+  setNow(surface, PEAK_AT)
+
+  const execFor = (sessionId) => ({ callId: 'c1', name: 'pwsh', arguments: {}, signal: new AbortController().signal, agent: { session: { id: sessionId } } })
+  const freeA = observe(fake.invoke('tools/pre-execute', execFor('session-a')))
+  const heldB = observe(fake.invoke('tools/pre-execute', execFor('session-b')))
+  await flush()
+  assert.equal(freeA.status, 'resolved')
+  assert.equal(heldB.status, 'pending')
+  assert.equal(surface.gate.waiterCountFor('session-b'), 1)
+})
+
+test('currentInitiator is the fallback when the payload carries no agent', async (t) => {
+  await withHome(t, async () => {
+    const timers = createFakeTimers(PEAK_AT)
+    const fake = createFakeCtx({ timers, agents: { currentInitiator: () => ({ session: { id: 'session-c' } }) } })
+    const surface = await mount(fake.ctx, { allowClockOverride: true }, { registry: [] })
+    await surface.handlers.mode({ mode: 'idle-only' })
+    await surface.handlers.mode({ mode: 'always', session: 'session-c' })
+    setNow(surface, PEAK_AT)
+
+    const free = observe(fake.invoke('agent/pre-step', { messages: [], turn: 1, step: 1, signal: new AbortController().signal }))
+    await flush()
+    assert.equal(free.status, 'resolved', 'the initiator session override applies even without payload.agent')
+    assert.equal(surface.gate.waiterCountFor('session-c'), 0)
+
+    // Without the service, the same request falls back to the default mode.
+    const bare = createFakeCtx({ timers })
+    const bareSurface = await mount(bare.ctx, { allowClockOverride: true }, { registry: [] })
+    await bareSurface.handlers.mode({ mode: 'idle-only' })
+    setNow(bareSurface, PEAK_AT)
+    const held = observe(bare.invoke('agent/pre-step', { messages: [], turn: 1, step: 1, signal: new AbortController().signal }))
+    await flush()
+    assert.equal(held.status, 'pending', 'no resolvable session → the default decides')
+    assert.equal(bareSurface.gate.unresolvedWaiterCount, 1)
+    assert.equal(
+      bare.logs.filter((entry) => entry.message.includes('no resolvable session id')).length,
+      1,
+      'the degradation is logged exactly once (P1-1)',
+    )
+    const state = (await bareSurface.handlers.state()).body.state
+    assert.equal(state.waitingTasksUnresolved, 1)
+    assert.equal(state.waitingTasks, 1, 'no session asked → host-wide count')
+    bare.disposeAll()
+  })
+})
+
+test('SEC-2: malformed mode writes never touch the default, end to end', async (t) => {
+  const { home, surface } = await mountPlugin(t)
+  await surface.handlers.mode({ mode: 'idle-only' })
+  const before = await readFile(join(home, STATE_FILE_NAME), 'utf8')
+  assert.equal(surface.store.snapshot().default, 'idle-only')
+
+  for (const body of [
+    { mode: 'always', session: null },
+    { mode: 'always', session: {} },
+    { mode: 'always', session: 123 },
+    { mode: 'always', session: '   ' },
+    { mode: 'always', session: '__proto__' },
+    { mode: 'always', session: 'x'.repeat(200) },
+    { mode: 'always', scope: 'session' },
+    { mode: 'always', session: 'session-a', scope: 'default' },
+    { mode: 'always', scope: 'nonsense' },
+  ]) {
+    const result = await surface.handlers.mode(body)
+    assert.ok(result.status >= 400 && result.status < 500, `expected 4xx for ${JSON.stringify(body)}`)
+    assert.equal(result.body.ok, false)
+  }
+  assert.equal(surface.store.snapshot().default, 'idle-only', 'the default is unchanged')
+  assert.deepEqual({ ...surface.store.snapshot().sessions }, {}, 'no session leaked in')
+  assert.equal(await readFile(join(home, STATE_FILE_NAME), 'utf8'), before, 'the state file bytes are unchanged')
+})
+
+test('P1-2: a `mode: null` write clears the session override through the plugin', async (t) => {
+  const { home, surface } = await mountPlugin(t)
+  await surface.handlers.mode({ mode: 'idle-only', scope: 'default' })
+  await surface.handlers.mode({ mode: 'always', session: 'session-a' })
+  assert.equal((await surface.handlers.state({ session: 'session-a' })).body.state.modeSource, 'session')
+
+  const cleared = await surface.handlers.mode({ mode: null, session: 'session-a', scope: 'session' })
+  assert.equal(cleared.status, 200)
+  const state = (await surface.handlers.state({ session: 'session-a' })).body.state
+  assert.equal(state.modeSource, 'default')
+  assert.equal(state.mode, 'idle-only')
+  const raw = JSON.parse(await readFile(join(home, STATE_FILE_NAME), 'utf8'))
+  assert.deepEqual(raw.sessions, {}, 'the synthetic session is gone from the real file')
+})
+
+test('P1-3: the gate is re-evaluated before a slow disk write settles', async (t) => {
+  await withHome(t, async () => {
+    const timers = createFakeTimers(PEAK_AT)
+    const fake = createFakeCtx({ timers })
+    let release = null
+    const sessions = new Map()
+    let defaultChoice = 'idle-only'
+    const slowStore = {
+      file: '(injected)',
+      read: async () => ({ version: 2, default: defaultChoice, sessions }),
+      snapshot: () => ({ version: 2, default: defaultChoice, sessions: Object.fromEntries(sessions) }),
+      modeFor: (sessionId) =>
+        sessions.has(sessionId) ? { mode: sessions.get(sessionId), source: 'session' } : { mode: defaultChoice, source: 'default' },
+      get defaultMode() {
+        return defaultChoice
+      },
+      // The in-memory change is synchronous; the returned promise is the disk
+      // write, which here never settles until the test says so.
+      setMode: (mode, sessionId = null) => {
+        if (sessionId === null) defaultChoice = mode
+        else sessions.set(sessionId, mode)
+        return new Promise((resolve) => {
+          release = () => resolve(true)
+        })
+      },
+      clearSession: async () => true,
+    }
+    const surface = await mount(fake.ctx, { allowClockOverride: true }, { registry: [], store: slowStore })
+    setNow(surface, PEAK_AT)
+
+    const held = observe(fake.invoke('agent/pre-step', { messages: [], turn: 1, step: 1, signal: new AbortController().signal, agent: { session: { id: 'session-x' } } }))
+    await flush()
+    assert.equal(held.status, 'pending', 'the idle-only default holds it')
+
+    // Flip the default to always. The write hangs; the gate must already have
+    // released the waiter when the promise is still pending.
+    const write = surface.handlers.mode({ mode: 'always', scope: 'default' })
+    await flush()
+    assert.equal(held.status, 'resolved', 'released before the disk write settled')
+    assert.equal(surface.gate.waiterCount, 0)
+    assert.equal(typeof release, 'function', 'the injected write was actually started')
+    release()
+    assert.equal((await write).status, 200)
+    fake.disposeAll()
+  })
 })

@@ -42,6 +42,12 @@ function peakSnapshot(overrides = {}) {
     peakWindows: ['09:00-12:00', '14:00-18:00'],
     clockOverride: null,
     config: { allowClockOverride: true },
+    // SPEC 9.3 per-session fields (a v2 envelope always carries them; without
+    // them the client treats the host as old and goes read-only).
+    sessionId: 'session-abc',
+    modeSource: 'session',
+    defaultMode: 'always',
+    waitingTasksTotal: 2,
     ...overrides,
   }
 }

@@ -627,3 +627,256 @@ the 9-day 国庆 idle stretch (2026-09-30 18:00 → 2026-10-08 09:00) is one seg
 "contiguous, covering `[fromMs, toMs)`", so phase-granularity splitting is defensible. Lead ruled
 "keep as-is, note it in SPEC"; the verifier test was aligned to the implementation and additionally
 asserts that every instant inside the span still classifies as `holiday`.
+
+---
+
+# §7. Per-session run windows (SPEC §9, 2026-10-14) — task-7
+
+Scope: `verify/session-store.test.mjs` (state-file contract), `verify/session-isolation.test.mjs`
+(isolation / sessionId source / tool gate / routes / counters / R5), `verify/e2e-sessions.mjs`
+(live). All verifier-owned; no `lib/**` or `test/**` file was touched.
+
+## 7.1 State file v2 (SPEC §9.1) — **已验证** (11/11)
+
+`node --test verify/session-store.test.mjs` → `tests 11 / pass 11 / fail 0`
+(`verify/logs/sess-store-20261014-193531.txt`):
+
+| Check | Verdict |
+|---|---|
+| v1 `{mode}` → v2 migration written back to disk; `default` preserved; `sessions` empty; exactly one log line; idempotent on re-read | 已验证 |
+| corrupt file → `{default:'always', sessions:{}}`, exactly one warning, never throws, next write valid v2 | 已验证 |
+| missing file → defaults, no throw | 已验证 |
+| malformed v2 (`default:'sometimes'`, invalid session mode/id) sanitized rather than trusted or thrown | 已验证 |
+| `modeFor`: `sessions[id]` → `default`; blank/absent id → `default`; one session's write never changes another's resolution | 已验证 |
+| 80 concurrent `setMode` calls → file parses, no `.tmp` litter, memory agrees with disk | 已验证 |
+| session cap bounded at `MAX_SESSIONS`; eviction logged; evicted session resolves to `default` (SPEC §9.6) | 已验证 |
+| **R5** `__proto__`: never "reported as a session" while the file lacks it, and no prototype pollution | 已验证 |
+| **B4** `a+b` vs `a b` do not collide; UUID ids unaffected | 已验证 |
+| **R4** real UUID shape: insertion/LRU-by-set order preserved (see caveat below) | 已验证 |
+
+### 7.1a Cap policy (SPEC §9.6) — measured, then ruled
+
+SPEC §9.1 specified no cap, so the verifier **measured** the behaviour instead of assuming it. The
+first hypothesis (FIFO) was **disproved by the data**: after `A`, `B`, then re-setting `A`, `A`
+moves to the last position → **LRU-by-set**. Consequence: with 500 entries, an untouched session is
+evicted after enough newer sessions and reverts to `default`.
+
+```
+[observation] MAX_SESSIONS=500; after being updated A sits at index 1 of 2 (a non-zero index means
+an update DOES refresh its recency, i.e. LRU-by-set); after 520 newer sessions A is EVICTED →
+reverts to default "always"
+```
+
+**Lead ruling (SPEC §9.6):** keep the 500 cap, document LRU-by-set, **log every eviction**, no UI
+warning (an evicted session truthfully reports `modeSource:'default'`). The implementation logs
+(`[peak-hours] evicted N oldest session override(s); cap is 500`) and the test asserts that log
+appears together with the eviction.
+
+**Re-measured after host-dev moved the in-memory container to a `Map`** (which by itself would
+preserve insertion order and therefore *break* LRU-by-set): an explicit update still moves the key
+to the back (`A,B,A` → file order `["B","A"]`), so §9.6 holds. The Map is an internal
+representation change — SPEC §9.1 freezes the *file* object, not the snapshot type — so the
+verifier's assertions were made container-agnostic (a `sessionCount()` helper plus `modeFor()`),
+which also removes a false-red source.
+
+### 7.1b Session-id shape sampling (Lead, this machine) — recorded
+
+All 129 directories under `C:\Users\81521\.dsh\sessions` are **UUID-shaped** (36 chars,
+`^[0-9a-f]{8}-[0-9a-f]{4}-…`); **0** numeric-only ids, **0** containing characters outside
+`[a-z0-9-]`, **0** containing `+` or a space; longest 36 chars. Qualitative conclusions the Lead
+drew from it, recorded here as sampled facts + reasoning:
+
+* **R4 does not fire in the real shape** — `Object.keys` hoists only integer-like keys, and UUIDs are
+  not integer-like, so insertion order (hence LRU-by-set) is what actually governs eviction. The
+  defensive fix is kept but is **not a blocker**.
+* **B4 does not fire either** — no real id contains `+`/space, so `?session=a+b` vs `a%2Bb` cannot
+  collide today. The case is still asserted as a defensive guard (and now passes).
+* **R6's 200-char cap** is generous against the real 36-char shape.
+* **R5 (`__proto__`) is the one genuinely reachable case** of R4/R5/R6/B4.
+
+## 7.2 R2 — a real methodological gap in the verifier's own test, fixed
+
+An acceptance review found that `drivePreStep` called the listener with the SAME fake agent as both
+`this` and `payload.agent`. On the live runtime `this` is an **opaque scoped carrier**
+(`this.session === undefined`, no `this.id`), so that helper let a wrong
+`this.session?.id ?? this.id` implementation pass — a **false green** that would have hidden the
+round's blocking defect.
+
+Fixed in `verify/session-isolation.test.mjs`:
+
+* `opaqueCarrier()` — no `session`, no `id`, only a symbol tag — is now the default `this`; the
+  session is supplied exclusively through `payload.agent`, which is the real call shape.
+* A dedicated test asserts the decision follows `payload.agent` **even when `this` lies** (a
+  `lyingCarrier` carrying a conflicting session id must be ignored).
+* A **mutation-teeth** test writes the wrong contract out as a twin listener
+  (`this.session?.id ?? this.id`) and asserts that the twin DELEGATES the `idle-only` session while
+  the real listener HOLDS it — i.e. the scenario genuinely discriminates the two contracts. A test
+  that cannot go red here is worthless, so this is asserted rather than assumed.
+* `drivePreExecute` already used `call({}, …)` and stays as-is (the Lead confirmed it is honest).
+
+The verifier initially recorded a **documentation mismatch** here (SPEC §9.2's table credited
+`agent/pre-step` with `this.session?.id ?? this.id`, contradicting the corrected contract). That
+observation was against a pre-ruling snapshot and is **withdrawn**: SPEC §9.2 L256 on disk now reads
+`payload.agent?.session?.id ?? payload.agent?.id`, names the dispatch source
+(`dsh-agent/lib/types/dispatch.js:37-42`), states that `this` is an opaque dsh-scope carrier whose
+`session`/`id` are both `undefined`, and adds the explicit ruling — *"Official listeners on this
+event read the injected agent from the payload, never from `this` … Do not reintroduce a
+`this`-based read: it fails silently and takes the whole per-session feature with it (Lead ruling
+2026-10-14, after the acceptance expert reproduced it)"*. The verifier's tests encode exactly that
+contract, including the mutation-teeth check that a `this`-based read cannot pass.
+
+## 7.3 Isolation / tool gate / routes / counters — **未验证** (framework ready, gated)
+
+`verify/session-isolation.test.mjs` (now 17 checks) is designed so a shared or last-write-wins mode
+variable cannot pass: A=`always` vs B=`idle-only` at a simulated peak driven with opaque carriers;
+**interleaved** writes (A, B, A, B) proving the decision comes from the task's own session; an
+unconfigured session following `default`; the tool gate keyed on `exec.agent.session.id` with a
+**missing `exec.agent`** falling back to `currentInitiator()` and still holding an `idle-only`
+session (asserted in both directions, including `default = idle-only`); the route contract
+(`?session=`, three `POST /mode` semantics, 4xx on bad input); and the **breaking change pinned** —
+`waitingTasks` is now the current session's count while `waitingTasksTotal` keeps the old host-wide
+number, with per-session release proven not to touch other sessions.
+
+The file **skips with an explicit reason** (visible as a non-zero `skipped` count) until the feature
+is wired end-to-end; per the Lead's freeze protocol the verifier is deliberately **not** adapting
+its v1-era tests until `lib/**` is frozen.
+
+## 7.4 Live multi-session — **未验证** (script ready)
+
+`verify/e2e-sessions.mjs` exists and its safe paths are exercised: against the current non-§9 live
+build it aborts cleanly with **exit 3** and a diagnosis, removes nothing, and leaves the real state
+file **byte-identical** (`8CF0D25C…`). It writes modes only for two SYNTHETIC session ids
+(`verify-sess-A/B`), `--cleanup` removes exactly those, and the clock override is TTL-bounded,
+watchdog-guarded, and cleared in a `finally`.
+
+Migration baseline captured before any deploy:
+`verify/baseline/state-file-v1-before-persession.txt` — the real
+`C:\Users\81521\.dsh\peak-hours-state.json` was v1
+`{"mode":"idle-only","updatedAt":"2026-10-14T06:36:18.431Z"}`, sha256
+`8CF0D25C8146ED8A9B8B02C36B50263738997C425DC2A7ACD9D3E17585599EFB`. After the deploy, the first live
+read must migrate it to v2 with `default:"idle-only"` and log exactly once — that baseline is the
+check.
+
+**Hard constraint (Lead):** `default` must stay `always` for the whole live window so a simulated
+peak cannot hold the Lead's own session; only the target subagent session may be `idle-only`.
+
+## 7.5 Verifier's own tooling defects this round (kept for the record)
+
+* **V4** — `verify/e2e-sessions.mjs` called `process.exit()` while a fetch keep-alive socket was
+  closing, tripping a libuv assertion and producing a garbage exit code (`-1073740791`) instead of
+  3. Fixed with a `Bail` sentinel plus a graceful `process.exitCode` + drain; the abort path now
+  exits cleanly with 3 (verified without pipeline truncation).
+* **V5** — the cap test referenced `logs` without destructuring it (`ReferenceError`). Fixed.
+* **V6** — four failures in the store suite were the verifier's own assumptions, not defects: three
+  asserted the in-memory snapshot is a plain object (host-dev moved to a `Map`), and one had a wrong
+  expected key order. All fixed; the suite is green again and now tolerates either container.
+
+## 7.6 Mid-flight warning (recorded for honesty)
+
+Two whole-repo/partial runs during this window reported failures while `lib/host/index.js` and
+`lib/host/store.js` were being edited **during the very same runs** (e.g. `index.js` sha256
+`845C70F8…` → `2198B752…` mid-run; `store.js` `C7FAEFC2…` → `AA1CD448…` mid-run). Those failures are
+construction noise from concurrent authoring, **not** findings, and are not reported as defects. Any
+green run must be tied to the frozen `lib/**` hash the Lead publishes.
+
+## 7.7 After host-dev's task-5 delivery — 34/34 已验证 (not yet on the frozen hash)
+
+host-dev reported task-5 delivered (`test/host` 138/138) and named four changes that hit the
+verifier's probes. The matrix was re-run and extended; against `index.js`/`store.js`/`routes.js` as
+of 19:45 +08:00 (`verify/logs/sess-matrix-20261014-194547.txt`):
+
+```
+node --test verify/session-isolation.test.mjs  → tests 20 / pass 20 / fail 0
+node --test verify/session-store.test.mjs      → tests 14 / pass 14 / fail 0
+```
+
+| host-dev change | verifier check | Verdict |
+|---|---|---|
+| **SEC-4** write fence: POST without `application/json` → 415, `sec-fetch-site: cross-site` → 403 | `SEC-4: the write fence answers 415 … and 403 for cross-site` — both on `/mode` and `/clock`; GET stays open; well-formed writes still 200 | 已验证 |
+| **R1/P1-1** unresolvable session → `default` **and no longer silent**: `waitingTasksUnresolved` + one warn | `P1-1: an unresolvable session is counted and warned once — never silent` — forged pre-step with no `payload.agent` and no initiator, `default=idle-only` at peak: `waitingTasksUnresolved` 0→1→2, returns to 0 on abort, and **exactly one** session warning for two waiters | 已验证 |
+| **R4/LRU** semantics | `R4/LRU discrimination: with cap 2, writing 3,1,2 leaves {1,2} — not {2,3}` and the agreeing `1,2,3 → {2,3}` case | 已验证 |
+| **P1-2** `mode:null` clears one session | `P1-2: mode:null clears one session override; without a session it is a 400` — also asserts the cleared id is **gone from the file**, not merely masked | 已验证 |
+| **R6** 128-char cap, reserved ids | `R6 / reserved ids` — `__proto__`/`constructor`/`prototype` never persisted nor resolved as sessions; a 129-char id refused; the file object stays a plain JSON object | 已验证 (128-char id is accepted at the cap — logged as `[observation] R6: 128-char id accepted`) |
+
+**On the disputed R4 case:** host-dev is right that true LRU-by-set leaves `{'1','2'}` for the write
+sequence `3,1,2` at a cap of 2, and that `{'2','3'}` is the *pre-fix* `Object.keys` numeric-ascending
+behaviour. The verifier's suite never encoded `{'2','3'}`; it now pins the discriminating case
+explicitly, so a regression back to numeric-ascending eviction would go red.
+
+**V7c (verifier tooling):** switching `e2e-sessions.mjs`'s cleanup to the new P1-2 route re-exposed
+the V4 hazard on the `--cleanup` path (`process.exit()` right after a fetch → libuv assertion, exit
+`-1073740791`). Fixed with the same graceful `process.exitCode` + drain; verified:
+`--cleanup` → exit 0, precondition path → exit 3, and the real state file stays **byte-identical**
+(`8CF0D25C…`). The cleanup now prefers `POST /mode {mode:null}` and keeps the state-file edit only
+as a fallback for builds without the route.
+
+**Still open (unchanged):** the 34 items above are *not yet* tied to a frozen `lib/**` hash, and the
+live two-session run (`verify/e2e-sessions.mjs`) remains **未验证** — the running build is still the
+pre-§9 one, so the script correctly aborts with exit 3 and changes nothing.
+
+## 7.8 FROZEN SNAPSHOT RUN — 已验证
+
+The Lead froze `lib/**` on 2026-10-14. The verifier re-hashed every frozen file locally and **all 11
+match** (full-run log `verify/logs/frozen-20261014-194853.txt`):
+
+| File | Frozen SHA256 (first 16) | Verifier |
+|---|---|---|
+| `lib/host/index.js` | `5FA19B64F5707A61` | MATCH |
+| `lib/host/gate.js` | `F422F2E63E6A7D81` | MATCH |
+| `lib/host/store.js` | `FD19899238F58AD5` | MATCH |
+| `lib/host/routes.js` | `2156CAAFE1F3D4E9` | MATCH |
+| `lib/host/state.js` | `27FCC2A47544E4F0` | MATCH |
+| `lib/host/clock.js` | `13794FD03C3BAF33` | MATCH |
+| `lib/host/core-bridge.js` | `CE3F7C1B4A9BABDD` | MATCH |
+| `lib/client/index.js` | `7869906510F39696` | MATCH |
+| `lib/core/schedule.js` | `D80784B94A19FA29` | MATCH |
+| `lib/core/holidays.js` | `56E26AD7965ADBA3` | MATCH |
+| `lib/core/index.js` | `5C69072914CB6DC7` | MATCH |
+
+```
+node --test "verify/*.test.mjs"   → tests 133 / pass 133 / fail 0 / skipped 0
+node --test                       → tests 513 / pass 513 / fail 0 / skipped 0
+node verify/repro-f5.mjs          → exit 0 (F5 fix holds)
+node verify/repro-f6.mjs          → exit 0 (mounts under real cordis, 4 routes)
+```
+
+### The 6 legacy verifier failures, adapted to the frozen v2 contract
+
+The Lead's list matched the verifier's own breakdown exactly. All six were **stale inputs in the
+verifier's tests**, not implementation defects; three of them were positive evidence that new
+behaviour works:
+
+1. `state store: missing, corrupt, …` — v1 asserted `read()` returns the string `'always'`; v2 returns
+   `{version,default,sessions}`. Now asserts `read().default`, plus `setMode(mode, null)` for the
+   repaired-write step.
+2. `state store: 200 rapid writes …` — `write()` became `setMode(mode, sessionId)`; now writes the
+   default and compares `defaultMode`. (`verify/repro-f5.mjs` was updated the same way.)
+3. `SPEC §2.5 labels` — the verifier fed a **v1-shaped** state, so the new client correctly degraded
+   to `时段不可用`. **Positive evidence** for the deliberate read-only degradation; the test now feeds
+   a v2 envelope (`modeSource`/`defaultMode`/`waitingTasks*`).
+4. `both registered components render …` — same cause plus SPEC §9.4: with **no session** the
+   occupants render nothing. The test now asserts that no-session case *and* renders with
+   `sessionId`.
+5. `real cordis: apply() …` and `unload disposes …` — the real-cordis stub sent POSTs without
+   `content-type`, so the new SEC-4 fence answered **415**. **Positive evidence** for the fence; the
+   stub now sends the header, exactly like the shipped client.
+
+### 7.8a R6 observation — closed (not a defect)
+
+The verifier's earlier `[observation] R6: 128-char id accepted` is **resolved as intended contract**:
+a session id is a non-empty string whose **trimmed** length must be ≤ 128
+(`lib/host/store.js:34 MAX_SESSION_ID_LENGTH = 128`, `sanitizeSessionId` at :72-90). Measured through
+the API:
+
+```
+128 chars      → POST 200, persisted, modeSource 'session'
+129 chars      → POST 400, not persisted, resolves 'default'
+128 + 2 spaces → POST 200, stored under the trimmed 128-char id
+```
+
+The store's own `setMode` silently ignores an over-long id, which is acceptable **only because the
+route rejects first** — now asserted at the HTTP layer so that silent path stays unreachable
+(`R6 at the HTTP layer: 128 chars ok, 129 refused with 400, ids normalized by trim`).
+
+
+

@@ -94,37 +94,37 @@ test('state store: missing, corrupt, unreadable and unrecognized inputs all fall
 
     // 1. missing
     const s1 = store.createModeStore({ file, logger })
-    assert.equal(await s1.read(), 'always', 'a missing state file must default to always')
-    assert.equal(await s1.read(), 'always', 'reads are repeatable')
+    assert.equal((await s1.read()).default, 'always', 'a missing state file must default to always')
+    assert.equal((await s1.read()).default, 'always', 'reads are repeatable')
 
     // 2. corrupt JSON
     writeFileSync(file, '{ this is not json at all', 'utf8')
     const s2 = store.createModeStore({ file, logger })
-    assert.equal(await s2.read(), 'always')
+    assert.equal((await s2.read()).default, 'always')
     assert.ok(logs.some((l) => /corrupt/i.test(l)), `expected a corrupt-file log, got ${JSON.stringify(logs)}`)
 
     // 3. valid JSON, wrong shape
     writeFileSync(file, JSON.stringify({ mode: 'sometimes' }), 'utf8')
-    assert.equal(await store.createModeStore({ file, logger }).read(), 'always')
+    assert.equal((await store.createModeStore({ file, logger }).read()).default, 'always')
 
     // 4. valid JSON, not an object
     writeFileSync(file, '[1,2,3]', 'utf8')
-    assert.equal(await store.createModeStore({ file, logger }).read(), 'always')
+    assert.equal((await store.createModeStore({ file, logger }).read()).default, 'always')
     writeFileSync(file, 'null', 'utf8')
-    assert.equal(await store.createModeStore({ file, logger }).read(), 'always')
+    assert.equal((await store.createModeStore({ file, logger }).read()).default, 'always')
 
     // 5. unreadable path (a directory, not a file)
     mkdirSync(join(dir, 'adir'), { recursive: true })
-    assert.equal(await store.createModeStore({ file: join(dir, 'adir'), logger }).read(), 'always')
+    assert.equal((await store.createModeStore({ file: join(dir, 'adir'), logger }).read()).default, 'always')
 
     // 6. valid idle-only round-trips, then a corrupt file is REPAIRED by a write
     writeFileSync(file, JSON.stringify({ mode: 'idle-only' }), 'utf8')
     const s6 = store.createModeStore({ file, logger })
-    assert.equal(await s6.read(), 'idle-only')
-    assert.equal(await s6.write('always'), true)
-    assert.equal(JSON.parse(readFileSync(file, 'utf8')).mode, 'always', 'the write must land as valid JSON')
+    assert.equal((await s6.read()).default, 'idle-only')
+    assert.equal(await s6.setMode('always', null), true)
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).default, 'always', 'the write must land as valid JSON (v2 shape)')
     writeFileSync(file, 'garbage', 'utf8')
-    assert.equal(await store.createModeStore({ file, logger }).read(), 'always')
+    assert.equal((await store.createModeStore({ file, logger }).read()).default, 'always')
   })
 })
 
@@ -141,10 +141,10 @@ test('state store: 200 rapid writes never corrupt the file and the last write wi
     const s = store.createModeStore({ file })
     await s.read()
     const modes = Array.from({ length: 200 }, (_, i) => (i % 2 === 0 ? 'always' : 'idle-only'))
-    await Promise.all(modes.map((m) => s.write(m)))
+    await Promise.all(modes.map((m) => s.setMode(m, null)))
     const last = modes[modes.length - 1]
-    assert.equal(s.peek(), last, 'in-memory mode must match the last request')
-    assert.equal(JSON.parse(readFileSync(file, 'utf8')).mode, last, 'the file must be the last write')
+    assert.equal(s.defaultMode, last, 'in-memory default must match the last request')
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).default, last, 'the file must be the last write')
     assert.deepEqual(readdirSync(dir), ['peak-hours-state.json'], 'no .tmp litter may survive the renames')
   })
 })

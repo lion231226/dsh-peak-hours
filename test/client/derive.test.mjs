@@ -31,6 +31,12 @@ function state(overrides = {}) {
     peakWindows: ['09:00-12:00', '14:00-18:00'],
     clockOverride: null,
     config: { allowClockOverride: true },
+    // SPEC 9.3 per-session fields: a v2 envelope always carries them, and the
+    // client reads an envelope without them as an old, read-only host.
+    sessionId: 'session-abc',
+    modeSource: 'session',
+    defaultMode: 'always',
+    waitingTasksTotal: 0,
     ...overrides,
   }
 }

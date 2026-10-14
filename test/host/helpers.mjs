@@ -115,25 +115,59 @@ export function createFakeTimers(startMs) {
   }
 }
 
-/** A gate wired to fake timers plus the fake schedule. */
-export function createFakeGate({ startMs, mode = 'idle-only', peakLeadMs = 0, schedule = createFakeSchedule(), classify, nextTransition } = {}) {
+/**
+ * A gate wired to fake timers plus the fake schedule.
+ * @param options.sessionModes - when given, per-session overrides with `mode` as
+ *   the host default (mirrors `sessions[id]` → `default`); when omitted every
+ *   session uses `mode`.
+ */
+export function createFakeGate({
+  startMs,
+  mode = 'idle-only',
+  sessionModes = null,
+  peakLeadMs = 0,
+  schedule = createFakeSchedule(),
+  classify,
+  nextTransition,
+  getMode: getModeOverride,
+  log = null,
+} = {}) {
   const timers = createFakeTimers(startMs)
   let currentMode = mode
+  const overrides = sessionModes === null ? null : { ...sessionModes }
+  const getMode =
+    typeof getModeOverride === 'function'
+      ? getModeOverride
+      : (sessionId) => {
+          if (overrides === null) return currentMode
+          const id = typeof sessionId === 'string' ? sessionId.trim() : ''
+          if (id !== '' && overrides[id] !== undefined) return overrides[id]
+          return currentMode
+        }
   const gate = new Gate({
     now: () => timers.now(),
     classify: classify ?? schedule.classify,
     nextTransition: nextTransition ?? schedule.nextTransition,
-    getMode: () => currentMode,
+    getMode,
     schedule: timers.schedule,
     peakLeadMs,
+    log,
   })
   return {
     timers,
     gate,
     schedule,
+    /** Set the host default mode (used by sessions without an override). */
     setMode: (next) => {
       currentMode = next
     },
+    /** Set/clear one session override. */
+    setSessionMode: (sessionId, next) => {
+      if (overrides === null) return
+      if (next === undefined || next === null) delete overrides[sessionId]
+      else overrides[sessionId] = next
+    },
+    modeFor: getMode,
     get mode() {
       return currentMode
     },
@@ -184,7 +218,7 @@ export function acceptPluginResult(value) {
  * A minimal cordis-context double: records listeners/effects/routes exactly the
  * way the runtime's `ctx.on`, `ctx.effect` and `ctx.webServer.register` do.
  */
-export function createFakeCtx({ timers = null } = {}) {
+export function createFakeCtx({ timers = null, agents = undefined } = {}) {
   const listeners = new Map()
   const routes = new Map()
   const effects = []
@@ -195,6 +229,7 @@ export function createFakeCtx({ timers = null } = {}) {
   const logger = { info: record('info'), warn: record('warn'), error: record('error'), debug: record('debug') }
   const ctx = {
     logger,
+    ...(agents === undefined ? {} : { agents }),
     timer: timers === null ? undefined : { timeout: (callback, delayMs) => timers.schedule(delayMs, callback) },
     on(event, handler, options = {}) {
       const entry = { handler, options, active: true }
@@ -232,6 +267,17 @@ export function createFakeCtx({ timers = null } = {}) {
     },
   }
   const activeListeners = (event) => (listeners.get(event) ?? []).filter((entry) => entry.active)
+  const invokeWith = async (event, thisArg, args) => {
+    const list = activeListeners(event)
+    const innermost = async () => ({ kind: 'enter', messages: [] })
+    let index = -1
+    const next = () => {
+      index += 1
+      const entry = list[index]
+      return entry === undefined ? innermost() : entry.handler.apply(thisArg, [...args, next])
+    }
+    return await next()
+  }
   return {
     ctx,
     listeners,
@@ -241,15 +287,15 @@ export function createFakeCtx({ timers = null } = {}) {
     activeListeners,
     /** Drive one waterfall exactly like cordis: outermost listener first, `next()` descends. */
     async invoke(event, ...args) {
-      const list = activeListeners(event)
-      const innermost = async () => ({ kind: 'enter', messages: [] })
-      let index = -1
-      const next = () => {
-        index += 1
-        const entry = list[index]
-        return entry === undefined ? innermost() : entry.handler(...args, next)
-      }
-      return await next()
+      return await invokeWith(event, undefined, args)
+    },
+    /**
+     * Drive one waterfall with an explicit `this`, mirroring cordis's
+     * `hook.callback.bind(thisArg)` (cordis/lib/index.js:259-263) where the
+     * bound receiver is the dispatch carrier.
+     */
+    async invokeBound(event, thisArg, ...args) {
+      return await invokeWith(event, thisArg, args)
     },
     /** Dispose every effect in reverse registration order, like the fiber does. */
     disposeAll() {
@@ -277,10 +323,12 @@ export function createFakeRequest({
 } = {}) {
   const raw = body === undefined ? '' : typeof body === 'string' ? body : JSON.stringify(body)
   const chunks = raw === '' ? [] : [Buffer.from(raw, 'utf8')]
+  // A real same-origin client always sends JSON; the SEC-4 fence requires it.
+  const defaults = method === 'POST' ? { 'content-type': 'application/json' } : {}
   return {
     method,
     url,
-    headers: { host, ...headers },
+    headers: { host, ...defaults, ...headers },
     socket: { remoteAddress },
     async *[Symbol.asyncIterator]() {
       for (const chunk of chunks) yield chunk

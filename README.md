@@ -93,23 +93,33 @@ the wait is abortable (pressing stop cancels it).
 
 Registered on the host's loopback web server; no GUI token is required on loopback.
 
+The mode is **per session**: every session carries its own choice, and a task is judged by the session that
+owns it. A session with no explicit choice follows `default`.
+
 | Method | Path | Body / result |
 | --- | --- | --- |
 | GET | `/api/peak-hours/health` | `{ ok, plugin, version }` |
-| GET | `/api/peak-hours/state` | the state envelope below |
-| POST | `/api/peak-hours/mode` | `{ "mode": "always" \| "idle-only" }` |
-| POST | `/api/peak-hours/clock` | `{ "offsetMs": <int\|null>, "ttlMs"?: <int> }` |
+| GET | `/api/peak-hours/state?session=<id>` | the state envelope below; without `?session=` it reports `default` |
+| POST | `/api/peak-hours/mode` | `{ "mode": "always" \| "idle-only" \| null, "session"?: "<id>", "scope"?: "session" \| "default" }` — `mode: null` with a session clears that override; neither field writes `default`. Requires `Content-Type: application/json` |
+| POST | `/api/peak-hours/clock` | `{ "offsetMs": <int\|null>, "ttlMs"?: <int> }`; `ttlMs` is capped at 30 minutes |
 
 ```jsonc
 { "ok": true, "state": {
-  "mode": "always", "phase": "idle", "reason": "off-hours",
+  "mode": "always", "defaultMode": "always", "modeSource": "session",
+  "sessionId": "session-abc", "phase": "idle", "reason": "off-hours",
   "now": 1791541815888, "nowText": "2026-10-09 18:30:15",
   "nextTransitionAt": 1791766800000, "nextTransitionText": "2026-10-12 09:00:00", "nextPhase": "peak",
-  "msUntilTransition": 224984112, "paused": false, "waitingTasks": 0,
+  "msUntilTransition": 224984112, "paused": false,
+  "waitingTasks": 0, "waitingTasksTotal": 0, "waitingTasksUnresolved": 0,
   "holidayToday": null, "holidayCoverage": "known", "unknownHolidayYear": null,
   "timeZone": "Asia/Shanghai (UTC+8)", "peakWindows": ["09:00-12:00", "14:00-18:00"],
   "clockOverride": null, "config": { "allowClockOverride": true } } }
 ```
+
+`waitingTasks` counts **the session named by `?session=`**, and the whole host when the parameter is absent —
+which is why the older session-less curl examples keep their meaning. `waitingTasksTotal` is always host-wide.
+`waitingTasksUnresolved` counts waiters whose session could not be resolved; those follow `default`, and the
+count exists so a resolution failure is visible instead of looking like "nothing is waiting".
 
 `clockOverride` shifts the host's notion of "now" so a peak window can be simulated without waiting for one.
 It always carries a TTL (10 minutes by default) and clears itself: without that, a session that is held by the
@@ -135,8 +145,12 @@ is not restricted by `years`.
 | `allowClockOverride` | `true` | Whether `POST /api/peak-hours/clock` is accepted |
 | `version` | from package.json | Version reported by `/health` |
 
-The selected mode is persisted in `%DSH_HOME%\peak-hours-state.json` with serialized atomic writes; a corrupt
-file falls back to `always` and logs once. Disposing the plugin releases every listener, timer and route.
+Per-session choices live in `%DSH_HOME%\peak-hours-state.json` as
+`{ "version": 2, "default": "always", "sessions": { "<sessionId>": "idle-only" } }`, written with serialized
+atomic writes. An older `{ "mode": ... }` file is migrated on first read — `default` takes that value and
+`sessions` starts empty — and a corrupt file falls back to `always` with an empty table, logging once. The table
+is capped at 500 entries and evicts the least recently written one, logging each eviction. Disposing the plugin
+releases every listener, timer and route.
 
 ## Known limits
 
@@ -144,7 +158,21 @@ file falls back to `always` and logs once. Disposing the plugin releases every l
 * Background processes in a terminal, and background shells started as jobs, are not agent steps and are not
   gated.
 * A message submitted during a peak window is not dropped — it waits and continues when the window ends.
-* `waitingTasks` in the state envelope is the host-wide gate count, so it can include tasks from other sessions.
+* Each session with a mounted client keeps its own poll (15 s, 3 s near a boundary), so request volume grows
+  with the number of open sessions.
+* Writing `default` changes every session that has no override of its own; the composer states that scope
+  before the change is made.
+
+## Upgrading from 0.1.x
+
+The mode used to be one host-wide value. It now lives per session, and the old value becomes `default`, so
+**every session without its own entry keeps behaving exactly as before** after the upgrade. Two things to know:
+
+* **Refresh the window after installing.** A page still running the 0.1.x client sends a bare `{mode}` write,
+  which the new host correctly reads as "write `default`" — i.e. the old bundle would reproduce the very bug
+  this release fixes.
+* **Downgrading loses `sessions`.** An 0.1.x build ignores the `sessions` table and rewrites the file in the old
+  shape, so back up or delete `%DSH_HOME%\peak-hours-state.json` before going back.
 
 ## Tests
 

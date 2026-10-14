@@ -4,10 +4,10 @@
  * `jsx`/`jsxs` call or a hook-order mistake fails here instead of only in the
  * browser.
  *
- * Covered: pill copy + dot per state, the popover's required contents, mode
- * selection POSTing `{ mode }` and re-rendering from the response, local 1 Hz
- * countdown with no extra network, 15 s polling + `visibilitychange`, and every
- * listener/timer being removed on close and on unmount.
+ * Covered: per-session reads and scoped writes (SPEC 9.3/9.4), pill copy + dot
+ * per state, the popover's required contents, local 1 Hz countdown with no extra
+ * network, adaptive polling + `visibilitychange`, and every listener/timer being
+ * removed on close and on unmount.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -18,11 +18,14 @@ import { createTreeRenderer } from './helpers/render.mjs'
 /** Let every pending promise chain settle (the fetch stub resolves immediately). */
 const flush = () => new Promise((resolve) => setImmediate(resolve))
 
-const STATE_URL = 'GET /api/peak-hours/state'
+const SESSION = 'session-abc'
+const OTHER_SESSION = 'session-xyz'
+const STATE_URL = `GET /api/peak-hours/state?session=${SESSION}`
+const OTHER_STATE_URL = `GET /api/peak-hours/state?session=${OTHER_SESSION}`
 const MODE_URL = 'POST /api/peak-hours/mode'
 const CLOCK_START = Date.UTC(2026, 9, 9, 10, 8, 6) // 2026-10-09 18:08:06 Beijing
 
-/** A SPEC 2.3 state object anchored on a fixed host clock. */
+/** A SPEC 2.3 + 9.3 state object anchored on a fixed host clock. */
 function state(overrides = {}) {
   return {
     mode: 'always',
@@ -43,12 +46,17 @@ function state(overrides = {}) {
     peakWindows: ['09:00-12:00', '14:00-18:00'],
     clockOverride: null,
     config: { allowClockOverride: true },
+    // SPEC 9.3 per-session fields.
+    sessionId: SESSION,
+    modeSource: 'session',
+    defaultMode: 'always',
+    waitingTasksTotal: 0,
     ...overrides,
   }
 }
 
 /** Wire one control instance with deterministic clock, timers, document and fetch. */
-function setup({ routes }) {
+function setup({ routes, sessionId = SESSION }) {
   const harness = createReactStub()
   const timers = createFakeTimers()
   const document = createFakeDocument()
@@ -58,11 +66,12 @@ function setup({ routes }) {
   const exports = materialize(load)
   const internals = exports.__internals
   const t = (key, params) => internals.translate(internals.DICTS, 'zh', key, params)
-  const renderer = createTreeRenderer(harness, internals.PeakHoursControl, { t })
+  const props = sessionId === null ? { t } : { t, sessionId }
+  const renderer = createTreeRenderer(harness, internals.PeakHoursControl, props)
   // The queue banner is a second occupant of the same session view; give it its
   // own hook context so both can be mounted from one harness, exactly as the
   // shell does.
-  const banner = createTreeRenderer(harness, internals.PeakHoursBanner, { t }, 'banner')
+  const banner = createTreeRenderer(harness, internals.PeakHoursBanner, props, 'banner')
   return { load, internals, renderer, banner, timers, document, clock, fetchImpl, t }
 }
 
@@ -145,20 +154,21 @@ test('clicking the pill opens a popover with both options and the required facts
   assert.equal(popover.props.role, 'dialog')
 
   const options = renderer.findAll((node) => node.props?.role === 'radio')
-  assert.equal(options.length, 2, 'exactly two selectable run windows')
+  assert.equal(options.length, 3, 'two run windows plus "follow the default"')
   assert.deepEqual(
     options.map((option) => option.props['data-mode']),
-    ['always', 'idle-only']
+    ['always', 'idle-only', 'follow']
   )
   assert.deepEqual(
     options.map((option) => option.props['data-selected']),
-    ['false', 'true'],
-    'the active mode must be marked'
+    ['false', 'true', 'false'],
+    'the active mode must be marked, and only it'
   )
 
   const text = renderer.text()
   assert.ok(text.includes('全天运行'), 'option 1')
   assert.ok(text.includes('仅空闲时段'), 'option 2')
+  assert.ok(text.includes('跟随默认值'), 'option 3')
   assert.ok(text.includes('2026-10-09 18:08:06'), 'the current Beijing time')
   assert.ok(text.includes('2026-10-12 09:00:00'), 'the next transition')
   assert.ok(text.includes('01:00:00'), 'the live countdown')
@@ -232,11 +242,11 @@ test('Escape closes the popover and the key listener is removed', async () => {
   assert.equal(document.count('pointerdown'), 0)
 })
 
-test('selecting 全天运行 POSTs the mode and re-renders from the response', async () => {
+test('9.4: selecting 全天运行 writes THIS session only and re-renders from the response', async () => {
   const { renderer, fetchImpl, internals } = setup({
     routes: {
       [STATE_URL]: envelope(state({ mode: 'idle-only', phase: 'peak', paused: true })),
-      [MODE_URL]: envelope(state({ mode: 'always' })),
+      [MODE_URL]: envelope(state({ mode: 'always', sessionId: SESSION, modeSource: 'session' })),
     },
   })
   renderer.render()
@@ -251,7 +261,7 @@ test('selecting 全天运行 POSTs the mode and re-renders from the response', a
   assert.equal(fetchImpl.count(MODE_URL), 1)
   const post = fetchImpl.calls.find((call) => call.key === MODE_URL)
   assert.equal(post.init.method, 'POST')
-  assert.equal(post.init.body, JSON.stringify({ mode: 'always' }))
+  assert.equal(post.init.body, JSON.stringify({ mode: 'always', scope: 'session', session: SESSION }))
   assert.deepEqual({ ...post.init.headers }, { 'content-type': 'application/json' })
   assert.equal(renderer.findByAttr('data-peak-hours', 'control').props['data-status'], 'always')
   assert.equal(internals.translate(internals.DICTS, 'zh', 'button.always'), '全天运行')
@@ -367,6 +377,14 @@ function detailValue(renderer, label) {
   if (!row) return undefined
   const value = row.props.children[1]
   return typeof value === 'string' ? value : value?.props?.children
+}
+
+/**
+ * One option row by its stable id. Scoped to `role="radio"` because the control
+ * root also carries `data-mode` (the resolved mode of this session).
+ */
+function radioOption(renderer, key) {
+  return renderer.find((node) => node.props?.role === 'radio' && node.props['data-mode'] === key)
 }
 
 test('P2: the popover shows the refreshing sentinel instead of a negative countdown', async () => {
@@ -606,4 +624,250 @@ test('P9: the banner counts down locally with the shared tick', async () => {
   banner.render()
   assert.ok(banner.text().includes('00:00:09'), banner.text())
   assert.equal(fetchImpl.count(STATE_URL), before, 'the countdown is local')
+})
+
+// ---------------------------------------------------------------------------
+// SPEC 9.3/9.4: per-session reads, scoped writes, and no session at all.
+// ---------------------------------------------------------------------------
+
+test('9.4: without a session neither occupant renders and nothing is requested', async () => {
+  const { renderer, banner, fetchImpl, timers } = setup({ routes: { [STATE_URL]: envelope(state()) }, sessionId: null })
+  assert.equal(renderer.render(), null, 'the pill renders nothing instead of a disabled control')
+  assert.equal(banner.render(), null)
+  await flush()
+  renderer.render()
+  banner.render()
+  assert.equal(fetchImpl.calls.length, 0, 'no session means no read, not a read of the default')
+  assert.equal(banner.text(), '')
+  assert.equal(timers.intervals.length, 0, 'and no timers either')
+})
+
+test('9.3: the read URL carries the session, so the answer is about this conversation', async () => {
+  const { renderer, banner, fetchImpl } = setup({
+    routes: {
+      [STATE_URL]: envelope(state({ mode: 'idle-only', phase: 'peak', paused: true, waitingTasks: 2 })),
+      [OTHER_STATE_URL]: envelope(state({ mode: 'always', sessionId: OTHER_SESSION, waitingTasks: 9 })),
+    },
+  })
+  renderer.render()
+  banner.render()
+  await flush()
+  renderer.render()
+  banner.render()
+  assert.equal(fetchImpl.count(STATE_URL), 1)
+  assert.equal(fetchImpl.count(OTHER_STATE_URL), 0, 'we never read another session')
+  assert.ok(fetchImpl.calls[0].url.includes('?session='), fetchImpl.calls[0].url)
+  // This session's own answer decides the pill, even though another session
+  // would answer differently.
+  assert.equal(renderer.findByAttr('data-peak-hours', 'control').props['data-mode'], 'idle-only')
+  assert.ok(banner.text().includes('2 个任务排队中'), banner.text())
+})
+
+test('9.3/9.4: the popover states both scopes, the resolved mode and its source', async () => {
+  const { renderer } = setup({
+    routes: {
+      [STATE_URL]: envelope(
+        state({ mode: 'idle-only', phase: 'peak', paused: true, waitingTasks: 2, waitingTasksTotal: 7, modeSource: 'default' })
+      ),
+    },
+  })
+  renderer.render()
+  await flush()
+  renderer.render()
+  renderer.fire(renderer.find((node) => node.type === 'button'), 'onClick')
+  const text = renderer.text()
+  assert.ok(text.includes('只改本会话'), `session scope note missing: ${text}`)
+  assert.ok(text.includes('默认值'), 'the resolved mode source must be visible')
+  assert.ok(text.includes('把「仅空闲时段」设为所有未单独设置的会话的默认值'), text)
+  assert.ok(text.includes('本会话的设置保持不变'), text)
+  const scopeNote = renderer.findByAttr('data-scope', 'session')
+  assert.ok(scopeNote, 'the session-scope note is a stable hook for the verifier')
+  const secondary = renderer.findByAttr('data-action', 'set-default')
+  assert.ok(secondary, 'the default entry must exist')
+  // Per-session and host-wide counts are both readable.
+  assert.equal(detailValue(renderer, '排队任务'), '2 个')
+  assert.equal(detailValue(renderer, '全部会话'), '7 个')
+  assert.equal(detailValue(renderer, '模式来源'), '默认值')
+})
+
+test('9.4: the secondary entry writes scope:"default" and never this session', async () => {
+  const { renderer, fetchImpl } = setup({
+    routes: {
+      [STATE_URL]: envelope(state({ mode: 'idle-only', phase: 'peak', paused: true })),
+      [MODE_URL]: envelope(state({ mode: 'idle-only', modeSource: 'session' })),
+    },
+  })
+  renderer.render()
+  await flush()
+  renderer.render()
+  renderer.fire(renderer.find((node) => node.type === 'button'), 'onClick')
+  renderer.fire(renderer.findByAttr('data-action', 'set-default'), 'onClick')
+  await flush()
+  renderer.render()
+  const post = fetchImpl.calls.find((call) => call.key === MODE_URL)
+  assert.ok(post, 'the default entry must POST')
+  assert.deepEqual(JSON.parse(post.init.body), { mode: 'idle-only', scope: 'default' })
+  // A default write says nothing about this session's own entry, so the client
+  // re-reads its session instead of trusting the echo. Three reads by now: the
+  // mount poll, the popover-open refresh, and this re-read.
+  assert.equal(fetchImpl.count(STATE_URL), 3, 'mount + open + re-read after the default write')
+})
+
+test('9.4: a default write never sends a session field (it would imply session scope)', async () => {
+  const { renderer, fetchImpl } = setup({
+    routes: {
+      [STATE_URL]: envelope(state({ mode: 'always', phase: 'idle', paused: false })),
+      [MODE_URL]: envelope(state({ mode: 'always' })),
+    },
+  })
+  renderer.render()
+  await flush()
+  renderer.render()
+  renderer.fire(renderer.find((node) => node.type === 'button'), 'onClick')
+  renderer.fire(renderer.findByAttr('data-action', 'set-default'), 'onClick')
+  await flush()
+  const body = JSON.parse(fetchImpl.calls.find((call) => call.key === MODE_URL).init.body)
+  assert.deepEqual(body, { mode: 'always', scope: 'default' })
+  assert.equal('session' in body, false)
+})
+
+test('9.3: a session write whose echo names another session is not trusted', async () => {
+  const { renderer, fetchImpl } = setup({
+    routes: {
+      [STATE_URL]: envelope(state({ mode: 'idle-only', phase: 'peak', paused: true })),
+      // A host that answered about the wrong session (or the default).
+      [MODE_URL]: envelope(state({ mode: 'always', sessionId: OTHER_SESSION, modeSource: 'default' })),
+    },
+  })
+  renderer.render()
+  await flush()
+  renderer.render()
+  renderer.fire(renderer.find((node) => node.type === 'button'), 'onClick')
+  renderer.fire(renderer.findAll((node) => node.props?.role === 'radio')[0], 'onClick')
+  await flush()
+  renderer.render()
+  assert.equal(fetchImpl.count(STATE_URL), 3, 'mount + open + re-read of our own session instead of showing the echo')
+  assert.equal(renderer.findByAttr('data-peak-hours', 'control').props['data-mode'], 'idle-only')
+})
+
+test('9.4: the banner counts this session, not the host-wide total', async () => {
+  const { banner } = setup({
+    routes: {
+      [STATE_URL]: envelope(state({ mode: 'idle-only', phase: 'peak', paused: true, waitingTasks: 2, waitingTasksTotal: 9 })),
+    },
+  })
+  banner.render()
+  await flush()
+  const tree = banner.render()
+  assert.equal(tree.props['data-count'], '2', 'the banner shows this session only')
+  assert.ok(banner.text().includes('2 个任务排队中'), banner.text())
+  assert.equal(banner.text().includes('9 个任务排队中'), false, 'other sessions never appear in the banner')
+})
+
+// ---------------------------------------------------------------------------
+// Follow-the-default option, and read-only degradation against a v1 host.
+// ---------------------------------------------------------------------------
+
+test('9.4: 「跟随默认值」 clears this session\'s override and is selected while following', async () => {
+  const { renderer, fetchImpl } = setup({
+    routes: {
+      [STATE_URL]: envelope(state({ mode: 'idle-only', phase: 'peak', paused: true, modeSource: 'default', defaultMode: 'idle-only' })),
+      [MODE_URL]: envelope(state({ mode: 'idle-only', modeSource: 'default' })),
+    },
+  })
+  renderer.render()
+  await flush()
+  renderer.render()
+  renderer.fire(renderer.find((node) => node.type === 'button'), 'onClick')
+
+  const follow = radioOption(renderer, 'follow')
+  assert.ok(follow, 'the third option must render')
+  assert.equal(follow.props['data-selected'], 'true', 'no session override ⇒ following the default is the current choice')
+  assert.equal(radioOption(renderer, 'idle-only').props['data-selected'], 'false', 'a defaulted mode is not a session setting')
+  assert.ok(renderer.text().includes('跟随默认值'), renderer.text())
+  assert.ok(renderer.text().includes('（当前默认值：仅空闲时段）'), renderer.text())
+
+  renderer.fire(follow, 'onClick')
+  await flush()
+  const body = JSON.parse(fetchImpl.calls.find((call) => call.key === MODE_URL).init.body)
+  assert.deepEqual(body, { mode: null, scope: 'session', session: SESSION })
+})
+
+test('9.3: the popover shows the unresolved-session diagnostic only when the host reports some', async () => {
+  const withSome = setup({
+    routes: {
+      [STATE_URL]: envelope(state({ mode: 'idle-only', phase: 'peak', paused: true, waitingTasks: 2, waitingTasksTotal: 7, waitingTasksUnresolved: 3 })),
+    },
+  })
+  withSome.renderer.render()
+  await flush()
+  withSome.renderer.render()
+  withSome.renderer.fire(withSome.renderer.find((node) => node.type === 'button'), 'onClick')
+  assert.equal(detailValue(withSome.renderer, '未识别会话的任务'), '3 个（按默认值判定）')
+
+  const none = setup({ routes: { [STATE_URL]: envelope(state({ mode: 'idle-only', phase: 'peak', paused: true, waitingTasks: 2 })) } })
+  none.renderer.render()
+  await flush()
+  none.renderer.render()
+  none.renderer.fire(none.renderer.find((node) => node.type === 'button'), 'onClick')
+  assert.equal(detailValue(none.renderer, '未识别会话的任务'), undefined, 'no field ⇒ no row')
+})
+
+test('9.4: 「跟随默认值」 is unselected once the session has its own choice', async () => {
+  const { renderer } = setup({
+    routes: { [STATE_URL]: envelope(state({ mode: 'always', phase: 'idle', paused: false, modeSource: 'session', defaultMode: 'idle-only' })) },
+  })
+  renderer.render()
+  await flush()
+  renderer.render()
+  renderer.fire(renderer.find((node) => node.type === 'button'), 'onClick')
+  assert.equal(radioOption(renderer, 'follow').props['data-selected'], 'false')
+  assert.equal(radioOption(renderer, 'always').props['data-selected'], 'true')
+  assert.ok(renderer.text().includes('（当前默认值：仅空闲时段）'), 'the description still names the default')
+})
+
+test('R8/9.3: a v1 host response yields a read-only popover and zero writes', async () => {
+  const v1 = {
+    mode: 'idle-only',
+    phase: 'peak',
+    reason: 'peak',
+    now: CLOCK_START,
+    nowText: '2026-10-09 18:08:06',
+    nextTransitionAt: CLOCK_START + 3_600_000,
+    nextTransitionText: '2026-10-12 09:00:00',
+    nextPhase: 'idle',
+    msUntilTransition: 3_600_000,
+    paused: true,
+    waitingTasks: 2,
+    holidayToday: null,
+    holidayCoverage: 'known',
+    unknownHolidayYear: null,
+    timeZone: 'Asia/Shanghai (UTC+8)',
+    peakWindows: ['09:00-12:00', '14:00-18:00'],
+    clockOverride: null,
+    config: { allowClockOverride: true },
+  }
+  const { renderer, banner, fetchImpl } = setup({ routes: { [STATE_URL]: envelope(v1) } })
+  renderer.render()
+  banner.render()
+  await flush()
+  renderer.render()
+  banner.render()
+
+  const control = renderer.findByAttr('data-peak-hours', 'control')
+  assert.equal(control.props['data-incompatible'], 'true')
+  assert.equal(control.props['data-status'], 'unavailable')
+
+  renderer.fire(renderer.find((node) => node.type === 'button'), 'onClick')
+  const popover = renderer.findByAttr('data-peak-hours', 'popover')
+  assert.equal(popover.props['data-incompatible'], 'true')
+  assert.ok(renderer.text().includes('宿主版本不匹配，请刷新页面'), renderer.text())
+  assert.equal(renderer.findAll((node) => node.props?.role === 'radio').length, 0, 'no clickable mode options')
+  assert.equal(renderer.findByAttr('data-action', 'set-default'), undefined, 'no default-scope entry either')
+  assert.equal(renderer.findByAttr('data-scope', 'session'), undefined, 'no scope note for a write that cannot happen')
+
+  // Nothing to click, and even a forced submit path stays silent: the popover
+  // offers no handler, and the component refuses to write through a v1 host.
+  assert.equal(fetchImpl.calls.filter((call) => call.key === MODE_URL).length, 0, 'not a single write may be sent')
+  assert.equal(banner.render(), null, 'the banner must not announce a hold it cannot verify')
 })
