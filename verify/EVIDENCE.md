@@ -878,5 +878,69 @@ The store's own `setMode` silently ignores an over-long id, which is acceptable 
 route rejects first** — now asserted at the HTTP layer so that silent path stays unreachable
 (`R6 at the HTTP layer: 128 chars ok, 129 refused with 400, ids normalized by trim`).
 
+## 7.9 LIVE two-session run against build 0.2.0 — 已验证
+
+Build under test (as instructed by the Lead): `/health` → `{"ok":true,"plugin":"dsh-peak-hours",
+"version":"0.2.0"}`, loader entry `include:peak-hours-v2` with `fiberPhase: active`, and the
+deployed files matching the frozen hashes (`host/index.js 5FA19B64F5707A61`,
+`routes.js 2156CAAFE1F3D4E9`, `client/index.js 7869906510F39696`).
+
+`node verify/e2e-sessions.mjs` → **12/12 checks passed, exit 0**
+(`verify/logs/live-sessions-20261014-195222.txt`). Raw highlights:
+
+```
+live baseline: mode=idle-only source=default default=idle-only
+PASS  session A resolves its own idle-only      :: {"mode":"idle-only","source":"session"}
+PASS  session B resolves its own always         :: {"mode":"always","source":"session"}
+PASS  B's choice did not leak into A            :: A=idle-only B=always
+PASS  no ?session= reports the default          :: {"mode":"always","source":"default","default":"always"}
+PASS  inside the simulated peak the window flipped on (oracle agrees) :: 2026-10-15 09:10:22 oracle=peak
+PASS  A (idle-only) reports paused=true, B (always) reports paused=false
+PASS  the next transition is the upcoming idle boundary :: 2026-10-15 12:00:00
+PASS  clock override cleared; A is no longer paused
+cleanup: removed synthetic sessions ["verify-sess-A","verify-sess-B"] (via POST /mode {mode:null} (P1-2))
+restored default → 200, now defaultMode=idle-only (expected idle-only)
+PASS  the user's original default was restored after the run
+```
+
+**This is the cross-session isolation claim verified on the real host**, not just in a harness: the
+same host-wide peak instant produced `paused:true` for the `idle-only` session and `paused:false`
+for the `always` session, with `modeSource:'session'` for each and no leakage either way.
+
+Safety constraints the Lead set were both honoured:
+
+* `default` was held at `always` for the whole run (so a simulated peak could not hold the Lead's
+  own session), then **restored to the user's `idle-only`** — asserted by re-reading it, not assumed;
+* the verifier's synthetic sessions were removed through the P1-2 exit, and the real state file is
+  **byte-identical before and after the run**: sha256
+  `3DE35C7BA4A65D3EEE6C5A4CFCD43037F666454ABD95CA2CF7EB480779214BDC` both times, ending as
+  `{"version":2,"default":"idle-only","sessions":{}}`.
+
+### 7.9a Live migration (performed by the Lead — recorded as third-party evidence)
+
+The v1 → v2 live migration was executed by the Lead, not observed by the verifier, so it is recorded
+here as third-party evidence with one instructive wrinkle the Lead reported and asked to keep: the
+`default` came out as **`always`** rather than the user's `idle-only`, because the bare `{mode}`
+endpoint had been exercised once with the OLD code (which had no content-type fence, so the write
+succeeded) immediately before the migration — the migration faithfully carried the value that was
+actually in the file. The Lead restored `default` to `idle-only`; the verifier confirmed the
+resulting file (`{"version":2,"default":"idle-only","sessions":{}}`) and that the pre-session
+baseline `verify/baseline/state-file-v1-before-persession.txt` still documents the original v1
+content. **Conclusion: verified by the Lead; not independently reproduced by the verifier.**
+
+### 7.9b Deployment trap worth recording (Lead): a fresh copy is not a fresh module
+
+The Lead hit and solved a trap that invalidates a naive "is it deployed?" check: copying the frozen
+build into a new directory (even via a junction) does **not** make the running host execute the new
+code, because **Node caches ES modules by URL** — while `readVersion()` reads `package.json` at
+runtime. The result is self-contradictory evidence: `/health` reports `0.2.0` while the behaviour is
+still the old build, and the genuinely-new instance fails to register its routes because the stale
+fiber still owns them. Resolution: **disable and re-enable the loader entry** so the residual fiber
+is destroyed. This is the same class of hazard as the verifier's V-series findings: a check that
+reads a *label* (`version`, `package.json`) instead of *behaviour* can be satisfied by the wrong
+artifact. It is why §7.9 above records behaviour (`paused` per session) and not just the reported
+version.
+
+
 
 

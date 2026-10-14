@@ -111,6 +111,7 @@ const watchdog = setTimeout(async () => {
 watchdog.unref?.()
 
 let exitCode = 0
+let originalDefault = null
 try {
   // ---------------------------------------------------------------- 0. preconditions
   const health = await api('/api/peak-hours/health')
@@ -122,6 +123,12 @@ try {
       '  Deploy task-5/task-6 first, then re-run. Nothing was changed.')
   }
   log(`live baseline: mode=${baseline.mode} source=${baseline.modeSource} default=${baseline.defaultMode}`)
+  // Remember the user's own default so the run can hand it back untouched. The run MUST hold
+  // `default = always` (otherwise a simulated peak would hold the Lead's own session, who is the
+  // one driving the verification), so the value has to be restored afterwards rather than left
+  // as the test's convenience value.
+  originalDefault = baseline.defaultMode
+  log(`original default captured for restoration: ${originalDefault}`)
 
   // ---------------------------------------------------------------- 1. API-level isolation
   await restore()
@@ -177,6 +184,17 @@ try {
   await restore()
   const r = await cleanupSessions()
   log(`cleanup: removed synthetic sessions ${JSON.stringify(r.removed)} (${r.note})`)
+  // Hand the user's own default back. Verified by re-reading it, not by assuming the write landed.
+  if (originalDefault) {
+    const wrote = await setMode({ mode: originalDefault, scope: 'default' })
+    const after = await stateOf()
+    log(`restored default → ${wrote.status}, now defaultMode=${after?.defaultMode} ` +
+      `(expected ${originalDefault})${after?.defaultMode === originalDefault ? '' : '  !! MISMATCH'}`)
+    check('the user\'s original default was restored after the run',
+      after?.defaultMode === originalDefault, `expected ${originalDefault}, got ${after?.defaultMode}`)
+  } else {
+    log('no original default captured (run aborted before the baseline read); leaving default as-is')
+  }
 }
 
 const failed = results.filter((r) => !r.ok)
