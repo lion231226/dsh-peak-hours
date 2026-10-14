@@ -941,6 +941,102 @@ reads a *label* (`version`, `package.json`) instead of *behaviour* can be satisf
 artifact. It is why §7.9 above records behaviour (`paused` per session) and not just the reported
 version.
 
+## 7.10 AGENT-SIDE hold of a real task — 已验证 (with one labelled inference)
+
+The gap left in §7.9 (API-level `paused` only, no evidence that a real agent's turn actually stops)
+is closed here. Tooling note first: `verify/canary-agent-hold.mjs` + a teammate session were used
+because `subagent` is unavailable to the verifier (`subagent depth 2 exceeds maxDepth 1`) and the
+session id had to be obtained deterministically (see 7.10c).
+
+**Setup.** Target session `cd42c401-d0cf-491b-9aa3-d70a65014b41` (host-dev, obtained from their own
+`$env:DSH_SESSION_ID`). `default` was forced to `always` so no other session could be caught; the
+target was set to `idle-only`; the clock override was armed at a simulated peak, real 19:59:11
+(virtual `2026-10-15 09:10:11`), TTL 120 s. The canary's next step was then triggered.
+
+**Directly observed (verifier's own samples, spooled in
+`verify/logs/canary-agent-20261014-195911.txt`):**
+
+```
+real time            virtual              session waiters   host total   paused
+19:59:11.436         2026-10-15 09:10:11   0                 0            true
+19:59:13.453         2026-10-15 09:10:13   0                 0            true
+19:59:15.470         2026-10-15 09:10:15   1                 1            true   ← held
+19:59:17.478         2026-10-15 09:10:17   1                 1            true
+19:59:19.499         2026-10-15 09:10:19   1                 1            true
+19:59:21.517         2026-10-15 09:10:21   1                 1            true
+19:59:23.534         2026-10-15 09:10:23   1                 1            true
+19:59:26.692         2026-10-15 09:10:26   1                 1            true   ← ~12 s sustained
+19:59:28.703         2026-10-14 19:59:28   0                 0            false  ← released
+```
+
+The per-session waiter counter for that session sat at **1 for six consecutive 2-second samples
+(~12 s)** — a sustained hold, not latency — and returned to 0 only once the peak override was gone.
+
+**Agent-side timeline (the canary's own timestamps, reported back verbatim):**
+
+```
+CANARY7 S1 19:59:57.382
+CANARY7 S2 20:00:23.784
+CANARY7 S3 20:00:35.448
+```
+
+**Correlation — observed vs inferred, stated separately:**
+
+* *Observed:* the commission's first command printed `S1` **after** `Start-Sleep -Seconds 25`, at
+  19:59:57.382; the session's waiter count was 1 from 19:59:15 to 19:59:26 and 0 from 19:59:28.
+* *Inferred (one step, labelled):* `S1 − 25 s ≈ 19:59:32` is when that command actually began —
+  i.e. **after** the hold ended. So the agent's step was genuinely blocked: its tool call did not
+  run while the gate held it, and it ran once the gate released.
+* *Not attributable to the gate:* the `S1 → S2` gap (26.4 s) — the override was already cleared by
+  then, so that gap is model/dispatch latency. Recorded explicitly so it is not over-claimed (same
+  discipline as the earlier canary correction).
+
+**Verdict: 已验证** — a real agent session's step was held at `agent/pre-step` for a sustained
+window and proceeded afterwards, with the agent's own timestamps corroborating that its command did
+not execute during the hold.
+
+### 7.10a Interference and a verifier tooling defect (V8)
+
+The override the verifier armed was **cleared externally at ~19:59:28**, one second before the
+script's own 12 s prove-threshold would have cleared it. Consequence: the script's auto-resume
+branch never ran (`clearedAt` stayed null), so it reported
+`releasing the clock override let the agent proceed … not observed within the window` and ran to its
+window limit. The substance above is unaffected — the hold and the release are both in the samples
+and in the canary's timestamps — but the check itself is a **false negative**. Fix noted: detect
+release by observing the counter fall, independent of *who* cleared the override.
+
+The environment at the time also shows a second, concurrent experiment (the Lead's own canary): a
+session override for `8f240a91-465a-445c-b73a-d39a8e6ecd4e = idle-only` and an armed override with
+`ttlMs=300000`. The verifier therefore **deliberately did not touch `default`** at that point
+(setting it to `idle-only` while a peak override is armed would hold every un-overridden session,
+including the Lead's), and left the restoration to the Lead.
+
+### 7.10b Environment note carried forward
+
+After the verifier's own run the state file read
+`{"version":2,"default":"always","sessions":{}}` — its script restored the value it captured
+(`always`, which the Lead had set for their concurrent experiment), **not** the user's `idle-only`.
+The verifier's last confirmed user-correct state was
+`{"version":2,"default":"idle-only","sessions":{}}`, sha256
+`3DE35C7BA4A65D3EEE6C5A4CFCD43037F666454ABD95CA2CF7EB480779214BDC`. Restoring `default=idle-only`
+once no override is armed remains open — reported to the Lead rather than done blind.
+
+### 7.10c Session identification: what does not work (methodology, per the Lead's request)
+
+1. **`subagent` is unavailable to a teammate**: `subagent depth 2 exceeds maxDepth 1`.
+2. **`~/.dsh/sessions` cannot be used to guess the newest session**: the layout is
+   `<workspace-slug>/<sessionId>/session.v4.jsonl.zstd`, and several live sessions (the verifier's,
+   the Lead's, a teammate's) share one workspace and are all written continuously. Guessing wrong
+   means holding the **Lead's own session** — an unacceptable risk, so it was not attempted; an
+   extra round trip was spent instead.
+3. **Session logs are not greppable for identification**: the `.zstd` files are multi-frame and
+   `zstdDecompressSync` decodes only the first frame (275 chars for a 2.6 MB file); streaming all
+   frames still yields only 200–280 chars, i.e. the payload is not a plaintext event stream. Marker
+   searches therefore find nothing.
+4. **What does work**: ask the agent for `$env:DSH_SESSION_ID`. That is deterministic and safe, and
+   the hold observation itself re-validates the id (only the right session can show a held waiter).
+
+
 
 
 
