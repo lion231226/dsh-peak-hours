@@ -186,23 +186,30 @@ test('9.3: the unresolved-session diagnostic is surfaced only when there is some
 })
 
 test('9.4: both scope wordings exist and say what they affect', () => {
-  const sessionNote = translate(DICTS, 'zh', 'scope.sessionNote', { source: '默认值' })
+  const sessionNote = translate(DICTS, 'zh', 'scope.sessionNote')
   assert.match(sessionNote, /只改本会话/)
-  assert.match(sessionNote, /默认值/)
+  assert.match(sessionNote, /不影响其他会话/)
+  assert.equal(sessionNote.includes('{source}'), false, 'the source lives in its own row, not in this sentence')
   const setDefault = translate(DICTS, 'zh', 'scope.setDefault', { mode: '全天运行' })
   assert.match(setDefault, /所有未单独设置的会话/)
   assert.match(setDefault, /全天运行/)
   const hint = translate(DICTS, 'zh', 'scope.setDefaultHint')
   assert.match(hint, /本会话的设置保持不变/)
   // English mirrors both.
-  assert.match(translate(DICTS, 'en', 'scope.sessionNote', { source: 'Default' }), /THIS session only/)
+  assert.match(translate(DICTS, 'en', 'scope.sessionNote'), /THIS session only/)
   assert.match(translate(DICTS, 'en', 'scope.setDefault', { mode: 'Always on' }), /sessions that never chose/)
 })
 
 test('9.4: the two scope labels are distinguishable and neither implies a global switch', () => {
-  const sessionText = translate(DICTS, 'zh', 'scope.sessionNote', { source: translate(DICTS, 'zh', 'source.session') })
+  const sessionText = translate(DICTS, 'zh', 'scope.sessionNote')
   const defaultText = translate(DICTS, 'zh', 'scope.setDefault', { mode: translate(DICTS, 'zh', 'option.always') })
   assert.notEqual(sessionText, defaultText)
-  assert.equal(/所有会话|全部会话的默认/.test(sessionText), false, 'a session write must not read as global')
+  assert.equal(/所有会话的默认|全部会话的默认/.test(sessionText), false, 'a session write must not read as global')
   assert.equal(/所有未单独设置的会话/.test(defaultText), true)
+})
+
+test('9.4: the default badge copy exists in both languages and is not a mode name', () => {
+  assert.equal(translate(DICTS, 'zh', 'option.defaultBadge'), '（默认）')
+  assert.equal(translate(DICTS, 'en', 'option.defaultBadge'), '(default)')
+  assert.equal(translate(DICTS, 'zh', 'option.follow'), 'option.follow', 'the removed option key must not resurrect')
 })

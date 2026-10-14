@@ -154,21 +154,20 @@ test('clicking the pill opens a popover with both options and the required facts
   assert.equal(popover.props.role, 'dialog')
 
   const options = renderer.findAll((node) => node.props?.role === 'radio')
-  assert.equal(options.length, 3, 'two run windows plus "follow the default"')
+  assert.equal(options.length, 2, 'two run windows, and only two')
   assert.deepEqual(
     options.map((option) => option.props['data-mode']),
-    ['always', 'idle-only', 'follow']
+    ['always', 'idle-only']
   )
   assert.deepEqual(
     options.map((option) => option.props['data-selected']),
-    ['false', 'true', 'false'],
-    'the active mode must be marked, and only it'
+    ['false', 'true'],
+    'the resolved mode must be marked, and only it'
   )
 
   const text = renderer.text()
   assert.ok(text.includes('全天运行'), 'option 1')
   assert.ok(text.includes('仅空闲时段'), 'option 2')
-  assert.ok(text.includes('跟随默认值'), 'option 3')
   assert.ok(text.includes('2026-10-09 18:08:06'), 'the current Beijing time')
   assert.ok(text.includes('2026-10-12 09:00:00'), 'the next transition')
   assert.ok(text.includes('01:00:00'), 'the live countdown')
@@ -765,32 +764,112 @@ test('9.4: the banner counts this session, not the host-wide total', async () =>
 })
 
 // ---------------------------------------------------------------------------
-// Follow-the-default option, and read-only degradation against a v1 host.
+// Two options, a dynamic "（默认）" badge, and read-only degradation (v1 host).
 // ---------------------------------------------------------------------------
 
-test('9.4: 「跟随默认值」 clears this session\'s override and is selected while following', async () => {
-  const { renderer, fetchImpl } = setup({
-    routes: {
-      [STATE_URL]: envelope(state({ mode: 'idle-only', phase: 'peak', paused: true, modeSource: 'default', defaultMode: 'idle-only' })),
-      [MODE_URL]: envelope(state({ mode: 'idle-only', modeSource: 'default' })),
-    },
+test('9.4: the popover offers exactly two options and no "follow the default" row', async () => {
+  const { renderer } = setup({
+    routes: { [STATE_URL]: envelope(state({ mode: 'idle-only', phase: 'peak', paused: true, defaultMode: 'idle-only' })) },
   })
   renderer.render()
   await flush()
   renderer.render()
   renderer.fire(renderer.find((node) => node.type === 'button'), 'onClick')
+  const options = renderer.findAll((node) => node.props?.role === 'radio')
+  assert.equal(options.length, 2, 'the user asked for two options')
+  assert.deepEqual(
+    options.map((option) => option.props['data-mode']),
+    ['always', 'idle-only']
+  )
+  assert.equal(radioOption(renderer, 'follow'), undefined, 'the redundant third option must be gone')
+  assert.equal(renderer.text().includes('跟随默认值'), false)
+})
 
-  const follow = radioOption(renderer, 'follow')
-  assert.ok(follow, 'the third option must render')
-  assert.equal(follow.props['data-selected'], 'true', 'no session override ⇒ following the default is the current choice')
-  assert.equal(radioOption(renderer, 'idle-only').props['data-selected'], 'false', 'a defaulted mode is not a session setting')
-  assert.ok(renderer.text().includes('跟随默认值'), renderer.text())
-  assert.ok(renderer.text().includes('（当前默认值：仅空闲时段）'), renderer.text())
-
-  renderer.fire(follow, 'onClick')
+test('9.4: the badge marks the option the host-wide default resolves to — both directions', async () => {
+  const idleDefault = setup({
+    routes: { [STATE_URL]: envelope(state({ mode: 'idle-only', phase: 'peak', paused: true, defaultMode: 'idle-only' })) },
+  })
+  idleDefault.renderer.render()
   await flush()
-  const body = JSON.parse(fetchImpl.calls.find((call) => call.key === MODE_URL).init.body)
-  assert.deepEqual(body, { mode: null, scope: 'session', session: SESSION })
+  idleDefault.renderer.render()
+  idleDefault.renderer.fire(idleDefault.renderer.find((node) => node.type === 'button'), 'onClick')
+  assert.equal(radioOption(idleDefault.renderer, 'idle-only').props['data-default'], 'true')
+  assert.equal(radioOption(idleDefault.renderer, 'always').props['data-default'], 'false')
+  assert.ok(idleDefault.renderer.text().includes('仅空闲时段（默认）'), idleDefault.renderer.text())
+
+  const alwaysDefault = setup({
+    routes: { [STATE_URL]: envelope(state({ mode: 'always', phase: 'idle', paused: false, modeSource: 'default', defaultMode: 'always' })) },
+  })
+  alwaysDefault.renderer.render()
+  await flush()
+  alwaysDefault.renderer.render()
+  alwaysDefault.renderer.fire(alwaysDefault.renderer.find((node) => node.type === 'button'), 'onClick')
+  assert.equal(radioOption(alwaysDefault.renderer, 'always').props['data-default'], 'true')
+  assert.equal(radioOption(alwaysDefault.renderer, 'idle-only').props['data-default'], 'false')
+  assert.ok(alwaysDefault.renderer.text().includes('全天运行（默认）'), alwaysDefault.renderer.text())
+  assert.equal(alwaysDefault.renderer.text().includes('仅空闲时段（默认）'), false)
+})
+
+test('9.4: with no override the default row is selected; with one, that row is', async () => {
+  // No override: resolved mode equals the default, and the default row is checked.
+  const following = setup({
+    routes: { [STATE_URL]: envelope(state({ mode: 'idle-only', phase: 'peak', paused: true, modeSource: 'default', defaultMode: 'idle-only' })) },
+  })
+  following.renderer.render()
+  await flush()
+  following.renderer.render()
+  following.renderer.fire(following.renderer.find((node) => node.type === 'button'), 'onClick')
+  assert.equal(radioOption(following.renderer, 'idle-only').props['data-selected'], 'true', 'a defaulted session shows the default row as current')
+  assert.equal(radioOption(following.renderer, 'always').props['data-selected'], 'false')
+  assert.equal(detailValue(following.renderer, '模式来源'), '默认值')
+
+  // With an override: the override row is checked, even though the default differs.
+  const overridden = setup({
+    routes: { [STATE_URL]: envelope(state({ mode: 'always', phase: 'idle', paused: false, modeSource: 'session', defaultMode: 'idle-only' })) },
+  })
+  overridden.renderer.render()
+  await flush()
+  overridden.renderer.render()
+  overridden.renderer.fire(overridden.renderer.find((node) => node.type === 'button'), 'onClick')
+  assert.equal(radioOption(overridden.renderer, 'always').props['data-selected'], 'true')
+  assert.equal(radioOption(overridden.renderer, 'idle-only').props['data-selected'], 'false')
+  assert.equal(radioOption(overridden.renderer, 'idle-only').props['data-default'], 'true', 'the default is still marked')
+  assert.equal(detailValue(overridden.renderer, '模式来源'), '本会话设置')
+})
+
+test('9.4: both options write an explicit session override — never mode:null', async () => {
+  for (const [index, mode] of [[0, 'always'], [1, 'idle-only']]) {
+    const { renderer, fetchImpl } = setup({
+      routes: {
+        [STATE_URL]: envelope(state({ mode: 'idle-only', phase: 'peak', paused: true, modeSource: 'default', defaultMode: 'idle-only' })),
+        [MODE_URL]: envelope(state({ mode, modeSource: 'session' })),
+      },
+    })
+    renderer.render()
+    await flush()
+    renderer.render()
+    renderer.fire(renderer.find((node) => node.type === 'button'), 'onClick')
+    renderer.fire(renderer.findAll((node) => node.props?.role === 'radio')[index], 'onClick')
+    await flush()
+    const body = JSON.parse(fetchImpl.calls.find((call) => call.key === MODE_URL).init.body)
+    assert.deepEqual(body, { mode, scope: 'session', session: SESSION })
+    assert.equal('mode' in body && body.mode === null, false, 'the interface no longer clears overrides')
+  }
+})
+
+test('9.4: the scope note names the two options and promises other sessions are untouched', async () => {
+  const { renderer } = setup({
+    routes: { [STATE_URL]: envelope(state({ mode: 'always', phase: 'idle', paused: false })) },
+  })
+  renderer.render()
+  await flush()
+  renderer.render()
+  renderer.fire(renderer.find((node) => node.type === 'button'), 'onClick')
+  const note = renderer.findByAttr('data-scope', 'session')
+  assert.ok(note, 'the scope note stays')
+  assert.equal(note.props.children, '两项都只改本会话，不影响其他会话')
+  assert.equal(renderer.text().includes('当前来源：'), false, 'the source moved to its own row')
+  assert.equal(detailValue(renderer, '模式来源'), '本会话设置')
 })
 
 test('9.3: the popover shows the unresolved-session diagnostic only when the host reports some', async () => {
@@ -811,19 +890,6 @@ test('9.3: the popover shows the unresolved-session diagnostic only when the hos
   none.renderer.render()
   none.renderer.fire(none.renderer.find((node) => node.type === 'button'), 'onClick')
   assert.equal(detailValue(none.renderer, '未识别会话的任务'), undefined, 'no field ⇒ no row')
-})
-
-test('9.4: 「跟随默认值」 is unselected once the session has its own choice', async () => {
-  const { renderer } = setup({
-    routes: { [STATE_URL]: envelope(state({ mode: 'always', phase: 'idle', paused: false, modeSource: 'session', defaultMode: 'idle-only' })) },
-  })
-  renderer.render()
-  await flush()
-  renderer.render()
-  renderer.fire(renderer.find((node) => node.type === 'button'), 'onClick')
-  assert.equal(radioOption(renderer, 'follow').props['data-selected'], 'false')
-  assert.equal(radioOption(renderer, 'always').props['data-selected'], 'true')
-  assert.ok(renderer.text().includes('（当前默认值：仅空闲时段）'), 'the description still names the default')
 })
 
 test('R8/9.3: a v1 host response yields a read-only popover and zero writes', async () => {

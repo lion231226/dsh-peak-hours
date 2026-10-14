@@ -1036,6 +1036,36 @@ once no override is armed remains open — reported to the Lead rather than done
 4. **What does work**: ask the agent for `$env:DSH_SESSION_ID`. That is deterministic and safe, and
    the hold observation itself re-validates the id (only the right session can show a held waiter).
 
+## 7.10d Closure — environment restored, independently re-verified
+
+The Lead restored the environment; the verifier re-checked each claim itself rather than accepting
+it (2026-10-14, after the closure message):
+
+| Claim | Verifier's raw check | Result |
+|---|---|---|
+| build still 0.2.0 | `GET /health` → `{"ok":true,"plugin":"dsh-peak-hours","version":"0.2.0"}` | 已验证 |
+| no override, idle, no waiters | `phase=idle reason=off-hours paused=false waiting=0 total=0 unresolved=0 clockOverride=null` | 已验证 |
+| default back to the user value | `defaultMode=idle-only`, `mode=idle-only` | 已验证 |
+| state file byte-identical to the verifier's pre-run baseline | content `{"version":2,"default":"idle-only","sessions":{}}`; sha256 `3DE35C7BA4A65D3EEE6C5A4CFCD43037F666454ABD95CA2CF7EB480779214BDC` = archived `verify/logs/canary-prerun-sha.txt` | 已验证 |
+| every probe session override removed | `?session=cd42c401-…` and `?session=8f240a91-…` both report `modeSource=default`, `waiting=0` | 已验证 |
+
+### Third-party evidence cited (not adopted as the verifier's conclusion)
+
+The Lead ran a complementary, attribution-clean end-to-end on a probe session
+`8f240a91-465a-445c-b73a-d39a8e6ecd4e` (id reported by the probe itself, and it was the only
+`idle-only` entry in the session table): the host stayed at `phase=peak` with `waitingTasksTotal=0`
+for two minutes, then became `1` at the instant that probe's sleep ended and stayed `1` across
++5 s / +10 s / +15 s; clearing the override returned it to `0` within 4 s and the probe's next
+command ran. Recorded by the Lead in `tools/diagnostics/gate-canary-live.md` (5479 bytes, written
+20:04:24, present). This is cited as **the Lead's** evidence — the verifier's own independent
+reproduction is §7.10 above (session `cd42c401…`, counter `1` across six consecutive 2-second
+samples). The two are independent: different sessions, different observers, same behaviour.
+
+**task-7 final state: completed (revision 3).** Every item is 已验证 except the API-level live
+migration *first read*, which the Lead performed and the verifier recorded as third-party evidence
+in §7.9a, verifying only its result.
+
+
 
 
 

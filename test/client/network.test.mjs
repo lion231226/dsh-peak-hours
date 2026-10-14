@@ -143,7 +143,10 @@ test('SEC-4: the write headers are exactly the JSON content type, not a simple-r
   assert.equal(fetchImpl.calls[0].init.credentials, 'same-origin')
 })
 
-test('9.4: a null mode is sent as null — it clears the override, it is not "always"', async () => {
+test('9.3: the request builder still passes mode:null through — an API capability the UI no longer offers', async () => {
+  // The interface writes explicit overrides only (both options send a real mode).
+  // The host keeps supporting "clear this session's override", so the builder must
+  // not silently turn null into "always" if some other caller ever uses it.
   const fetchImpl = createFetchStub({ status: 200, body: { ok: true, state: { ...STATE, modeSource: 'default', defaultMode: 'idle-only' } } })
   const result = await pushMode(fetchImpl, null, modeTarget('session', SESSION))
   assert.equal(result.error, null)
